@@ -356,6 +356,9 @@ h1::after {
   text-shadow: 0 0 16px rgba(232, 192, 96, 0.4), 0 2px 4px rgba(0,0,0,0.6);
 }
 
+/* ============================================================
+   Блоки «кому сколько передать / получить»
+   ============================================================ */
 .debts-label {
   font-family: 'Cinzel', serif;
   font-size: 12px;
@@ -376,15 +379,31 @@ h1::after {
   background: linear-gradient(135deg, #14120e 0%, #1a1610 100%);
   border: 1px solid #3a2e1e;
   border-radius: 4px;
-  padding: 14px 10px;
+  padding: 12px 10px;
   text-align: center;
   box-shadow: inset 0 1px 0 rgba(200, 160, 80, 0.06), inset 0 -1px 0 rgba(0,0,0,0.5);
   transition: border-color 0.2s, box-shadow 0.2s;
+  position: relative;
 }
+
+/* Должен передать — золотистый акцент */
+.debt-block.owes {
+  border-color: #5a3e1e;
+  box-shadow: inset 0 1px 0 rgba(200, 160, 80, 0.12), inset 0 -1px 0 rgba(0,0,0,0.5);
+}
+
+/* Должен получить — зелёный акцент */
+.debt-block.receive {
+  border-color: #2a5e2a;
+  box-shadow: inset 0 1px 0 rgba(100, 200, 80, 0.12), inset 0 -1px 0 rgba(0,0,0,0.5);
+}
+
+/* Рассчитано — приглушённый нейтральный */
 .debt-block.zero {
-  border-color: #2a3e2a;
-  box-shadow: inset 0 1px 0 rgba(100, 160, 80, 0.06), inset 0 -1px 0 rgba(0,0,0,0.5);
+  border-color: #2a3028;
+  box-shadow: inset 0 1px 0 rgba(100, 140, 100, 0.05), inset 0 -1px 0 rgba(0,0,0,0.5);
 }
+
 .debt-name {
   font-family: 'Cinzel', serif;
   font-size: 12px;
@@ -394,6 +413,7 @@ h1::after {
   text-transform: uppercase;
   margin-bottom: 6px;
 }
+
 .debt-amount {
   font-family: 'Cinzel', serif;
   font-size: 20px;
@@ -403,14 +423,43 @@ h1::after {
   margin-bottom: 6px;
   line-height: 1.2;
 }
-.debt-block.zero .debt-amount {
+.debt-block.receive .debt-amount {
   color: #8ac06a;
-  text-shadow: 0 0 12px rgba(138, 192, 106, 0.35), 0 1px 2px rgba(0,0,0,0.6);
+  text-shadow: 0 0 12px rgba(138, 192, 106, 0.4), 0 1px 2px rgba(0,0,0,0.6);
 }
+.debt-block.zero .debt-amount {
+  color: #6a7a68;
+  text-shadow: 0 0 8px rgba(106, 122, 104, 0.3), 0 1px 2px rgba(0,0,0,0.6);
+}
+
+.debt-status {
+  display: inline-block;
+  font-family: 'Cinzel', serif;
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 2px;
+  margin-bottom: 6px;
+}
+.debt-block.owes .debt-status {
+  color: #d4b878;
+  background: rgba(200, 160, 80, 0.12);
+}
+.debt-block.receive .debt-status {
+  color: #8ac06a;
+  background: rgba(138, 192, 106, 0.12);
+}
+.debt-block.zero .debt-status {
+  color: #6a7a68;
+  background: rgba(100, 140, 100, 0.08);
+}
+
 .debt-hint {
   font-size: 11px;
   color: #6a5a48;
   letter-spacing: 0.2px;
+  line-height: 1.4;
 }
 .debt-hint b { color: #a09078; font-weight: 400; }
 

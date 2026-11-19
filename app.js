@@ -14,8 +14,8 @@
 
   const PARTICIPANTS = ['ArhonDD', 'eMachines', 'Asta'];
   const PERSON_KEY = 'expense_person_v1';
+  const CURRENCY = ' К';
 
-  // ---------- Firebase ----------
   let stateRef = null;
   try {
     if (typeof firebase !== 'undefined') {
@@ -24,7 +24,6 @@
     }
   } catch (e) { console.warn('[app] Firebase:', e); }
 
-  // ---------- Сброс в 06:00 МСК ----------
   const MSK_OFFSET_MIN = 3 * 60;
   const RESET_HOUR_MSK = 6;
   const SHIFT_MS = (MSK_OFFSET_MIN - RESET_HOUR_MSK * 60) * 60 * 1000;
@@ -42,7 +41,6 @@
     };
   }
 
-  // ---------- Нормализация ----------
   function migrateItems(raw) {
     if (!raw) return {};
     const entries = Array.isArray(raw)
@@ -56,7 +54,7 @@
       if (!id) continue;
       if (!val.text || typeof val.text !== 'string') continue;
       out[id] = {
-        id: id, text: val.text, checked: !!val.checked,
+        id, text: val.text, checked: !!val.checked,
         ...(typeof val.createdAt === 'number' ? { createdAt: val.createdAt } : {})
       };
     }
@@ -99,7 +97,6 @@
     return out;
   }
 
-  // ---------- Время (06:00 МСК) ----------
   function shiftedNow() { return new Date(Date.now() + SHIFT_MS); }
   function accountingDateKey() {
     const d = shiftedNow();
@@ -219,8 +216,7 @@
   }
 
   // ============================================================
-  //  ГАРАНТИРОВАННАЯ МИГРАЦИЯ expenses
-  //  Создаёт contributions на сервере, если их нет
+  //  МИГРАЦИЯ expenses
   // ============================================================
   async function ensureExpensesStructure() {
     if (!stateRef) return;
@@ -233,21 +229,17 @@
           total: 0,
           contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
         });
-        console.log('[app] ensureExpenses: created fresh structure');
+        console.log('[app] ensureExpenses: created fresh');
         return;
       }
-
-      // Скаляр (число/строка) — старая структура
       if (typeof curr !== 'object') {
         await stateRef.child('expenses').set({
           total: Number(curr) || 0,
           contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
         });
-        console.log('[app] ensureExpenses: fixed scalar total');
+        console.log('[app] ensureExpenses: fixed scalar');
         return;
       }
-
-      // Есть total, но нет contributions
       if (!curr.contributions) {
         await stateRef.child('expenses/contributions').set({
           ArhonDD: 0, eMachines: 0, Asta: 0
@@ -255,8 +247,6 @@
         console.log('[app] ensureExpenses: created contributions');
         return;
       }
-
-      // contributions есть, но не у всех участников — дополняем
       const updates = {};
       let needs = false;
       for (const p of PARTICIPANTS) {
@@ -267,15 +257,13 @@
       }
       if (needs) {
         await stateRef.update(updates);
-        console.log('[app] ensureExpenses: filled missing participants');
+        console.log('[app] ensureExpenses: filled missing');
       }
-    } catch (e) {
-      console.warn('[app] ensureExpenses:', e);
-    }
+    } catch (e) { console.warn('[app] ensureExpenses:', e); }
   }
 
   // ============================================================
-  //  ТРАНЗАКЦИИ на узел daily / weekly
+  //  ТРАНЗАКЦИИ daily/weekly
   // ============================================================
   function txKind(kind, mutator) {
     if (!stateRef) return Promise.resolve();
@@ -292,7 +280,7 @@
   }
 
   // ============================================================
-  //  АВТОСБРОС 06:00 МСК
+  //  АВТОСБРОС
   // ============================================================
   function autoReset() {
     const d = accountingDateKey();
@@ -368,21 +356,47 @@
   }
 
   // ============================================================
-  //  РЕНДЕР расходов
+  //  РАСХОДЫ: расчёт долгов
   // ============================================================
-  function renderTotal() {
-    const el = document.getElementById('total-value');
-    if (el) el.textContent = fmtMoney(state.expenses.total);
-  }
-
   function computeDebts() {
     const total = Number(state.expenses.total) || 0;
     const fair = Math.ceil(total / 3);
-    return PARTICIPANTS.map(name => {
+
+    // 1) Кто сколько должен в общий котёл (формула пользователя)
+    const debts = PARTICIPANTS.map(name => {
       const contributed = Number(state.expenses.contributions[name]) || 0;
-      const owes = Math.max(0, fair - contributed);
-      return { name, contributed, owes, fair };
+      return {
+        name, contributed, fair,
+        owes: Math.max(0, fair - contributed),
+        receives: 0
+      };
     });
+
+    // 2) Кто переплатил — тот получает всё, что собрали с должников
+    const totalOwes = debts.reduce((s, d) => s + d.owes, 0);
+    const overpayers = debts.filter(d => d.contributed > fair);
+
+    if (overpayers.length === 1) {
+      overpayers[0].receives = totalOwes;
+    } else if (overpayers.length > 1) {
+      const totalOverpay = overpayers.reduce((s, d) => s + (d.contributed - fair), 0);
+      let distributed = 0;
+      overpayers.forEach((d, i) => {
+        if (i === overpayers.length - 1) {
+          d.receives = totalOwes - distributed;
+        } else {
+          d.receives = Math.round(totalOwes * (d.contributed - fair) / totalOverpay);
+          distributed += d.receives;
+        }
+      });
+    }
+
+    return debts;
+  }
+
+  function renderTotal() {
+    const el = document.getElementById('total-value');
+    if (el) el.textContent = fmtMoney(state.expenses.total) + CURRENCY;
   }
 
   function renderDebts() {
@@ -392,24 +406,49 @@
       return;
     }
     grid.innerHTML = '';
+
     const debts = computeDebts();
     debts.forEach(d => {
       const block = document.createElement('div');
-      block.className = 'debt-block' + (d.owes === 0 ? ' zero' : '');
+      let cls = 'debt-block';
+      let amountText;
+      let statusText;
+
+      if (d.receives > 0) {
+        cls += ' receive';
+        amountText = fmtMoney(d.receives) + CURRENCY;
+        statusText = 'должен получить';
+      } else if (d.owes > 0) {
+        cls += ' owes';
+        amountText = fmtMoney(d.owes) + CURRENCY;
+        statusText = 'должен передать';
+      } else {
+        cls += ' zero';
+        amountText = '0' + CURRENCY;
+        statusText = 'рассчитано';
+      }
+      block.className = cls;
 
       const nameEl = document.createElement('div');
       nameEl.className = 'debt-name';
       nameEl.textContent = d.name;
 
+      const statusEl = document.createElement('div');
+      statusEl.className = 'debt-status';
+      statusEl.textContent = statusText;
+
       const amountEl = document.createElement('div');
       amountEl.className = 'debt-amount';
-      amountEl.textContent = d.owes === 0 ? '0 ₽' : fmtMoney(d.owes) + ' ₽';
+      amountEl.textContent = amountText;
 
       const hintEl = document.createElement('div');
       hintEl.className = 'debt-hint';
-      hintEl.innerHTML = 'вложил <b>' + fmtMoney(d.contributed) + ' ₽</b><br>доля <b>' + fmtMoney(d.fair) + ' ₽</b>';
+      hintEl.innerHTML =
+        'вложил <b>' + fmtMoney(d.contributed) + CURRENCY + '</b><br>' +
+        'доля <b>' + fmtMoney(d.fair) + CURRENCY + '</b>';
 
       block.appendChild(nameEl);
+      block.appendChild(statusEl);
       block.appendChild(amountEl);
       block.appendChild(hintEl);
       grid.appendChild(block);
@@ -471,15 +510,11 @@
 
   // ============================================================
   //  ДЕЙСТВИЯ: расходы
-  //  Сначала пробуем атомарную транзакцию на expenses.
-  //  Если правило Firebase не разрешает запись в узел-родитель —
-  //  падаем в fallback: две отдельные транзакции по листьям.
   // ============================================================
   function addExpense(person, amount) {
     if (!PARTICIPANTS.includes(person)) return;
     if (!(amount > 0)) return;
 
-    // Оптимистично
     state.expenses.total = (Number(state.expenses.total) || 0) + amount;
     state.expenses.contributions[person] =
       (Number(state.expenses.contributions[person]) || 0) + amount;
@@ -500,7 +535,7 @@
           contribs[person] = (Number(contribs[person]) || 0) + amount;
           return { total, contributions: contribs };
         });
-        console.log('[app] addExpense OK (parent tx):', person, '+', amount);
+        console.log('[app] addExpense OK:', person, '+', amount);
       } catch (e) {
         console.warn('[app] addExpense parent tx failed, FALLBACK:', e && e.message);
         await stateRef.child('expenses/total').transaction(v => (Number(v) || 0) + amount);
@@ -517,24 +552,13 @@
     state.expenses.contributions = { ArhonDD: 0, eMachines: 0, Asta: 0 };
     renderTotal();
     renderDebts();
-
     if (stateRef) {
-      enqueueWrite(async () => {
-        try {
-          // Атомарный update по конкретным путям —
-          // работает даже при жёстких per-leaf правилах
-          await stateRef.update({
-            'expenses/total': 0,
-            'expenses/contributions/ArhonDD': 0,
-            'expenses/contributions/eMachines': 0,
-            'expenses/contributions/Asta': 0
-          });
-          console.log('[app] resetDebt OK');
-        } catch (e) {
-          console.error('[app] resetDebt FAILED:', e && e.message);
-          throw e;
-        }
-      }, 'resetDebt');
+      enqueueWrite(() => stateRef.update({
+        'expenses/total': 0,
+        'expenses/contributions/ArhonDD': 0,
+        'expenses/contributions/eMachines': 0,
+        'expenses/contributions/Asta': 0
+      }), 'resetDebt');
     }
   }
 
@@ -547,7 +571,6 @@
       const snap = await stateRef.once('value');
       const data = snap.val();
       if (!data) return;
-
       for (const kind of ['daily', 'weekly']) {
         const raw = data[kind];
         if (!raw || !raw.items) continue;
@@ -555,7 +578,6 @@
         const entries = Array.isArray(items)
           ? items.map((v, i) => [String(i), v])
           : Object.entries(items);
-
         let needs = false;
         for (const [key, val] of entries) {
           if (!val || typeof val !== 'object') { needs = true; break; }
@@ -564,7 +586,6 @@
           if (val.id !== key) { needs = true; break; }
         }
         if (!needs) continue;
-
         console.log('[app] cleanup needed for', kind);
         enqueueWrite(() => txKind(kind, (base, cleanItems) => {
           return { items: cleanItems };
@@ -597,7 +618,6 @@
       const el = document.getElementById(id);
       if (el) el.addEventListener('click', fn);
     };
-
     bind('daily-add', () => {
       const inp = document.getElementById('daily-input');
       if (!inp) return;
@@ -669,7 +689,6 @@
     });
     setInterval(() => { renderChecklist('daily'); renderChecklist('weekly'); }, 60 * 1000);
     setInterval(autoReset, 60 * 1000);
-
     scheduleReset();
   }
 
