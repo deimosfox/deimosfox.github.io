@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>R2 Учет</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+  <h1>R2 Учет</h1>
+
+  <!-- Дневной чек-лист -->
+  <div class="card">
+    <h2>
+      Ежедневный чек-лист
+      <span class="reset-info" id="daily-reset-info"></span>
+    </h2>
+    <ul class="checklist" id="daily-list"></ul>
+    <div class="add-row">
+      <input type="text" id="daily-input" placeholder="Новый пункт..." maxlength="80">
+      <button class="btn btn-primary" id="daily-add">Добавить</button>
+    </div>
+  </div>
+
+  <!-- Недельный чек-лист -->
+  <div class="card">
+    <h2>
+      Недельный чек-лист
+      <span class="reset-info" id="weekly-reset-info"></span>
+    </h2>
+    <ul class="checklist" id="weekly-list"></ul>
+    <div class="add-row">
+      <input type="text" id="weekly-input" placeholder="Новый пункт..." maxlength="80">
+      <button class="btn btn-primary" id="weekly-add">Добавить</button>
+    </div>
+  </div>
+
+  <!-- Учет трат -->
+  <div class="card">
+    <h2>Учет трат</h2>
+    <div class="expense-row">
+      <input type="number" id="expense-input" placeholder="Потрачено на расходники" min="0" step="0.01">
+      <button class="btn btn-primary" id="expense-add">Добавить</button>
+    </div>
+    <div class="total-box">
+      <span class="label">Итого потрачено:</span>
+      <span class="value" id="total-value">0</span>
+    </div>
+    <button class="btn btn-danger" id="reset-debt">Обнулить долг</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
