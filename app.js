@@ -1,7 +1,6 @@
 (function() {
   'use strict';
 
-  // ---------- Конфигурация Firebase ----------
   const firebaseConfig = {
     apiKey: "AIzaSyBa9iQuchwluGrEMdhPPkyS3_iU6wE8E1A",
     authDomain: "sinovodstvo.firebaseapp.com",
@@ -13,27 +12,61 @@
     measurementId: "G-4ETB2HXY4Z"
   };
 
-  // Инициализация Firebase
-  firebase.initializeApp(firebaseConfig);
-  const db = firebase.database();
-  const stateRef = db.ref('accounting_state');
-
-  // Сброс ровно в 05:00 МСК (UTC+3)
-  const MSK_OFFSET_MIN = 3 * 60;
-  const RESET_HOUR_MSK = 5;
-  const RESET_MSK_MINUTES = RESET_HOUR_MSK * 60;
-  const SHIFT_MS = (MSK_OFFSET_MIN - RESET_MSK_MINUTES) * 60 * 1000; // = -2ч
-
-  let state = {
-    daily: { items: [], lastReset: null },
-    weekly: { items: [], lastReset: null },
-    expenses: { total: 0 }
-  };
-
-  // ---------- Время (05:00 МСК) ----------
-  function shiftedNow() {
-    return new Date(Date.now() + SHIFT_MS);
+  // ---------- Инициализация Firebase ----------
+  let stateRef = null;
+  try {
+    if (typeof firebase !== 'undefined') {
+      firebase.initializeApp(firebaseConfig);
+      stateRef = firebase.database().ref('accounting_state');
+    } else {
+      console.warn('[app] Firebase SDK не загружен — работаем локально');
+    }
+  } catch (e) {
+    console.warn('[app] Ошибка Firebase:', e);
+    stateRef = null;
   }
+
+  // ---------- Сброс в 06:00 МСК ----------
+  const MSK_OFFSET_MIN = 3 * 60;        // UTC+3
+  const RESET_HOUR_MSK = 6;             // ← было 5
+  const RESET_MSK_MINUTES = RESET_HOUR_MSK * 60;
+  // Сдвиг = (UTC+3) − 06:00 = −3 часа
+  const SHIFT_MS = (MSK_OFFSET_MIN - RESET_MSK_MINUTES) * 60 * 1000;
+
+  let state = defaultState();
+
+  // ---------- Нормализация ----------
+  function defaultState() {
+    return {
+      daily: { items: [], lastReset: null },
+      weekly: { items: [], lastReset: null },
+      expenses: { total: 0 }
+    };
+  }
+
+  function normalizeState(raw) {
+    const out = defaultState();
+    if (!raw || typeof raw !== 'object') return out;
+
+    ['daily', 'weekly'].forEach(kind => {
+      const src = raw[kind];
+      if (!src) return;
+      if (Array.isArray(src.items)) {
+        out[kind].items = src.items;
+      } else if (src.items && typeof src.items === 'object') {
+        out[kind].items = Object.values(src.items);
+      }
+      if (src.lastReset) out[kind].lastReset = src.lastReset;
+    });
+
+    if (raw.expenses && typeof raw.expenses.total === 'number') {
+      out.expenses.total = raw.expenses.total;
+    }
+    return out;
+  }
+
+  // ---------- Время (06:00 МСК) ----------
+  function shiftedNow() { return new Date(Date.now() + SHIFT_MS); }
 
   function accountingDateKey() {
     const d = shiftedNow();
@@ -48,31 +81,23 @@
     const dayNr = (target.getUTCDay() + 6) % 7;
     target.setUTCDate(target.getUTCDate() - dayNr + 3);
     const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
-    const diff = target - firstThursday;
-    const week = 1 + Math.round(diff / (7 * 24 * 3600 * 1000));
+    const week = 1 + Math.round((target - firstThursday) / (7 * 24 * 3600 * 1000));
     return target.getUTCFullYear() + '-W' + String(week).padStart(2, '0');
   }
 
   function nextDailyResetUTC() {
     const now = Date.now();
-    const nowShifted = new Date(now + SHIFT_MS);
-    const nextMidnightShifted = Date.UTC(
-      nowShifted.getUTCFullYear(), nowShifted.getUTCMonth(), nowShifted.getUTCDate() + 1, 0, 0, 0, 0
-    );
-    return nextMidnightShifted - SHIFT_MS;
+    const s = new Date(now + SHIFT_MS);
+    return Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + 1) - SHIFT_MS;
   }
 
   function nextWeeklyResetUTC() {
     const now = Date.now();
-    const nowShifted = new Date(now + SHIFT_MS);
-    const dayNr = (nowShifted.getUTCDay() + 6) % 7;
+    const s = new Date(now + SHIFT_MS);
+    const dayNr = (s.getUTCDay() + 6) % 7;
     let daysToMonday = (7 - dayNr) % 7;
     if (daysToMonday === 0) daysToMonday = 7;
-    const nextMonShifted = Date.UTC(
-      nowShifted.getUTCFullYear(), nowShifted.getUTCMonth(), nowShifted.getUTCDate() + daysToMonday,
-      0, 0, 0, 0
-    );
-    return nextMonShifted - SHIFT_MS;
+    return Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + daysToMonday) - SHIFT_MS;
   }
 
   function fmtMsk(utcMs) {
@@ -82,28 +107,30 @@
            pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ' МСК';
   }
 
-  // ---------- Синхронизация с Firebase ----------
+  // ---------- Синхронизация ----------
   let isSyncing = false;
   let pendingSave = false;
-  let lastServerJson = ''; // для отслеживания реальных изменений
+  let lastServerJson = '';
 
   function loadFromServer() {
-    return stateRef.once('value').then(snapshot => {
-      const data = snapshot.val();
+    if (!stateRef) return Promise.resolve();
+    return stateRef.once('value').then(snap => {
+      const data = snap.val();
       if (data) {
-        state = Object.assign(state, data);
-        lastServerJson = JSON.stringify(state);
+        state = normalizeState(data);
+        lastServerJson = JSON.stringify(data);
         renderAll();
       }
-    }).catch(e => console.warn('Ошибка загрузки с Firebase:', e));
+    }).catch(e => console.warn('[app] load:', e));
   }
 
   function saveToServer() {
+    if (!stateRef) return;
     if (isSyncing) { pendingSave = true; return; }
     isSyncing = true;
     stateRef.set(state)
       .then(() => { lastServerJson = JSON.stringify(state); })
-      .catch(e => console.warn('Ошибка сохранения в Firebase:', e))
+      .catch(e => console.warn('[app] save:', e))
       .finally(() => {
         isSyncing = false;
         if (pendingSave) { pendingSave = false; saveToServer(); }
@@ -111,13 +138,11 @@
   }
 
   function save() {
-    // Локальный кеш — мгновенно
     try { localStorage.setItem('accounting_app_v1', JSON.stringify(state)); } catch (e) {}
-    // Отправка в Firebase — асинхронно
     saveToServer();
   }
 
-  // ---------- Автосброс чек-листов ----------
+  // ---------- Автосброс ----------
   function autoReset() {
     const t = accountingDateKey();
     const w = accountingWeekKey();
@@ -141,9 +166,10 @@
     const data = state[kind];
     const listEl = document.getElementById(kind + '-list');
     const infoEl = document.getElementById(kind + '-reset-info');
+    if (!listEl || !infoEl) return;
     listEl.innerHTML = '';
 
-    if (data.items.length === 0) {
+    if (!data.items || data.items.length === 0) {
       const li = document.createElement('li');
       li.className = 'empty-msg';
       li.textContent = 'Пунктов пока нет';
@@ -166,7 +192,7 @@
         btn.textContent = '×';
         btn.title = 'Удалить';
         btn.addEventListener('click', () => {
-          state[kind].items = data.items.filter(i => i.id !== item.id);
+          state[kind].items = state[kind].items.filter(i => i.id !== item.id);
           save(); renderChecklist(kind);
         });
 
@@ -175,17 +201,15 @@
       });
     }
 
-    if (kind === 'daily') {
-      infoEl.textContent = 'сброс: ' + fmtMsk(nextDailyResetUTC());
-    } else {
-      infoEl.textContent = 'сброс: ' + fmtMsk(nextWeeklyResetUTC());
-    }
+    infoEl.textContent = kind === 'daily'
+      ? 'сброс: ' + fmtMsk(nextDailyResetUTC())
+      : 'сброс: ' + fmtMsk(nextWeeklyResetUTC());
   }
 
   function renderTotal() {
     const total = Number(state.expenses.total) || 0;
-    document.getElementById('total-value').textContent =
-      total.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+    const el = document.getElementById('total-value');
+    if (el) el.textContent = total.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
   }
 
   function renderAll() { renderChecklist('daily'); renderChecklist('weekly'); renderTotal(); }
@@ -193,94 +217,101 @@
   // ---------- Действия ----------
   function addItem(kind, inputId) {
     const input = document.getElementById(inputId);
+    if (!input) return;
     const text = input.value.trim();
     if (!text) return;
+    if (!Array.isArray(state[kind].items)) state[kind].items = [];
     state[kind].items.push({
       id: Date.now() + '_' + Math.random().toString(36).slice(2, 7),
       text, checked: false
     });
-    input.value = ''; save(); renderChecklist(kind);
+    input.value = '';
+    save();
+    renderChecklist(kind);
   }
 
   function addExpense() {
     const input = document.getElementById('expense-input');
+    if (!input) return;
     const val = parseFloat(input.value);
     if (isNaN(val) || val <= 0) { input.focus(); return; }
     state.expenses.total = (Number(state.expenses.total) || 0) + val;
-    input.value = ''; save(); renderTotal();
+    input.value = '';
+    save(); renderTotal();
   }
 
   function resetDebt() {
     if (confirm('Обнулить долг? Это действие нельзя отменить.')) {
-      state.expenses.total = 0; save(); renderTotal();
+      state.expenses.total = 0;
+      save(); renderTotal();
     }
   }
 
-  // ---------- Планировщик сброса на 05:00 МСК ----------
+  // ---------- Планировщик сброса ----------
   let resetTimer = null;
-
   function scheduleReset() {
     if (resetTimer) clearTimeout(resetTimer);
     let delay = nextDailyResetUTC() - Date.now();
     if (delay < 0) delay = 1000;
     resetTimer = setTimeout(() => {
-      autoReset();
-      renderAll();
-      scheduleReset();
+      autoReset(); renderAll(); scheduleReset();
     }, delay + 500);
   }
 
+  // ---------- Обработчики ----------
+  function attachListeners() {
+    const bind = (id, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('click', fn);
+    };
+    bind('daily-add', () => addItem('daily', 'daily-input'));
+    bind('weekly-add', () => addItem('weekly', 'weekly-input'));
+    bind('expense-add', addExpense);
+    bind('reset-debt', resetDebt);
+
+    const d = document.getElementById('daily-input');
+    if (d) d.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('daily', 'daily-input'); });
+    const w = document.getElementById('weekly-input');
+    if (w) w.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('weekly', 'weekly-input'); });
+    const ex = document.getElementById('expense-input');
+    if (ex) ex.addEventListener('keydown', e => { if (e.key === 'Enter') addExpense(); });
+  }
+
   // ---------- Инициализация ----------
-  async function init() {
-    // Сначала локальный кеш (мгновенный отклик)
+  function init() {
     try {
       const raw = localStorage.getItem('accounting_app_v1');
-      if (raw) state = Object.assign(state, JSON.parse(raw));
+      if (raw) state = normalizeState(JSON.parse(raw));
     } catch (e) {}
     autoReset();
     renderAll();
 
-    // Затем — свежие данные с Firebase
-    await loadFromServer();
-    autoReset();
-    renderAll();
+    attachListeners();
 
-    document.getElementById('daily-add').addEventListener('click', () => addItem('daily', 'daily-input'));
-    document.getElementById('weekly-add').addEventListener('click', () => addItem('weekly', 'weekly-input'));
-    document.getElementById('daily-input').addEventListener('keydown', e => { if (e.key === 'Enter') addItem('daily', 'daily-input'); });
-    document.getElementById('weekly-input').addEventListener('keydown', e => { if (e.key === 'Enter') addItem('weekly', 'weekly-input'); });
-    document.getElementById('expense-add').addEventListener('click', addExpense);
-    document.getElementById('expense-input').addEventListener('keydown', e => { if (e.key === 'Enter') addExpense(); });
-    document.getElementById('reset-debt').addEventListener('click', resetDebt);
+    if (stateRef) {
+      loadFromServer().then(() => { autoReset(); renderAll(); });
 
-    // Синхронизация в реальном времени: любые изменения в Firebase
-    // (от других пользователей или этого же) применяются к state
-    stateRef.on('value', snapshot => {
-      const data = snapshot.val();
-      if (!data) return;
-      const serverJson = JSON.stringify(data);
-      // Если пришло изменение, которое мы ещё не применили
-      if (serverJson !== lastServerJson) {
-        state = Object.assign(state, data);
-        lastServerJson = serverJson;
-        autoReset();
-        renderAll();
-      }
-    });
+      stateRef.on('value', snap => {
+        const data = snap.val();
+        if (!data) return;
+        const serverJson = JSON.stringify(data);
+        if (serverJson !== lastServerJson) {
+          state = normalizeState(data);
+          lastServerJson = serverJson;
+          autoReset();
+          renderAll();
+        }
+      });
+    }
 
-    // При возвращении на вкладку — подтягиваем свежие данные
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
-        loadFromServer().then(() => { autoReset(); renderAll(); });
+        if (stateRef) loadFromServer().then(() => { autoReset(); renderAll(); });
+        else { autoReset(); renderAll(); }
       }
     });
 
-    // Раз в минуту — обновление подписей о времени сброса
-    setInterval(() => {
-      renderChecklist('daily');
-      renderChecklist('weekly');
-    }, 60 * 1000);
-
+    setInterval(() => { renderChecklist('daily'); renderChecklist('weekly'); }, 60 * 1000);
     scheduleReset();
   }
 
