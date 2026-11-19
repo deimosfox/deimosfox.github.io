@@ -12,7 +12,6 @@
     measurementId: "G-4ETB2HXY4Z"
   };
 
-  // ---------- Firebase ----------
   let stateRef = null;
   try {
     if (typeof firebase !== 'undefined') {
@@ -21,7 +20,7 @@
     }
   } catch (e) { console.warn('[app] Firebase:', e); }
 
-  // ---------- Сброс в 06:00 МСК ----------
+  // Сброс в 06:00 МСК
   const MSK_OFFSET_MIN = 3 * 60;
   const RESET_HOUR_MSK = 6;
   const SHIFT_MS = (MSK_OFFSET_MIN - RESET_HOUR_MSK * 60) * 60 * 1000;
@@ -36,15 +35,63 @@
     };
   }
 
+  // ============================================================
+  //  НОРМАЛИЗАЦИЯ ДАННЫХ ИЗ FIREBASE
+  //  Приводит любую «грязь» (массивы, фантомы, смешанные ключи)
+  //  к чистому объекту { id: { id, text, checked, createdAt? } }
+  // ============================================================
+  function migrateItems(raw) {
+    if (!raw) return {};
+    const entries = Array.isArray(raw)
+      ? raw.map((v, i) => [String(i), v])
+      : Object.entries(raw);
+    const out = {};
+    for (const [key, val] of entries) {
+      if (!val || typeof val !== 'object') continue;
+      // Фантом: нет id. Пытаемся взять id из ключа, если ключ не числовой.
+      let id = val.id;
+      if (!id) {
+        const keyIsNumeric = /^\d+$/.test(key);
+        if (!keyIsNumeric) id = key; // ключ = id (нормальный случай)
+        // Если ключ числовой и id нет — это битые данные, дропаем.
+      }
+      if (!id) continue;
+      if (!val.text || typeof val.text !== 'string') {
+        // Фантом с id, но без текста — тоже дропаем (там нет полезной информации).
+        continue;
+      }
+      out[id] = {
+        id: id,
+        text: val.text,
+        checked: !!val.checked,
+        ...(typeof val.createdAt === 'number' ? { createdAt: val.createdAt } : {})
+      };
+    }
+    return out;
+  }
+
+  function itemOrder(item) {
+    if (typeof item.createdAt === 'number') return item.createdAt;
+    const fromId = parseInt(String(item.id).split('_')[0], 10);
+    return isNaN(fromId) ? Infinity : fromId;
+  }
+
+  function itemsToSortedArray(itemsObj) {
+    const arr = Object.values(itemsObj);
+    arr.sort((a, b) => {
+      if (a.checked !== b.checked) return a.checked ? 1 : -1;
+      return itemOrder(a) - itemOrder(b);
+    });
+    return arr;
+  }
+
   function normalizeState(raw) {
     const out = defaultState();
     if (!raw || typeof raw !== 'object') return out;
     ['daily', 'weekly'].forEach(kind => {
       const src = raw[kind];
       if (!src) return;
-      if (Array.isArray(src.items)) out[kind].items = src.items;
-      else if (src.items && typeof src.items === 'object')
-        out[kind].items = Object.values(src.items);
+      out[kind].items = itemsToSortedArray(migrateItems(src.items));
       if (src.lastReset) out[kind].lastReset = src.lastReset;
     });
     if (raw.expenses && typeof raw.expenses.total === 'number')
@@ -52,7 +99,9 @@
     return out;
   }
 
-  // ---------- Время (06:00 МСК) ----------
+  // ============================================================
+  //  ВРЕМЯ (06:00 МСК)
+  // ============================================================
   function shiftedNow() { return new Date(Date.now() + SHIFT_MS); }
   function accountingDateKey() {
     const d = shiftedNow();
@@ -93,7 +142,7 @@
   let isProcessingQueue = false;
 
   function enqueueWrite(fn, description) {
-    writeQueue.push({ fn, description, createdAt: Date.now() });
+    writeQueue.push({ fn, description });
     if (!isProcessingQueue) processQueue();
   }
 
@@ -103,19 +152,15 @@
     try {
       while (writeQueue.length > 0) {
         const item = writeQueue[0];
-        let succeeded = false;
+        let ok = false;
         for (let attempt = 1; attempt <= 5; attempt++) {
-          try {
-            await item.fn();
-            succeeded = true;
-            break;
-          } catch (e) {
-            console.warn('[app] Write attempt ' + attempt + ' failed:',
-              item.description, e);
-            if (attempt < 5) await new Promise(r => setTimeout(r, attempt * 800));
+          try { await item.fn(); ok = true; break; }
+          catch (e) {
+            console.warn('[app] attempt', attempt, 'failed:', item.description, e);
+            if (attempt < 5) await new Promise(r => setTimeout(r, attempt * 700));
           }
         }
-        if (!succeeded) console.error('[app] Giving up on:', item.description);
+        if (!ok) console.error('[app] giving up:', item.description);
         writeQueue.shift();
       }
     } finally {
@@ -124,16 +169,15 @@
         try {
           const snap = await stateRef.once('value');
           if (snap && snap.val()) applyServerData(snap.val());
-        } catch (e) { console.warn('[app] Final sync:', e); }
+        } catch (e) { console.warn('[app] final sync:', e); }
       }
     }
   }
 
   // ============================================================
-  //  REALTIME SYNC
+  //  SYNC
   // ============================================================
   let lastAppliedJson = '';
-
   function applyServerData(data) {
     const json = JSON.stringify(data);
     if (json === lastAppliedJson) return;
@@ -141,7 +185,6 @@
     lastAppliedJson = json;
     renderAll();
   }
-
   function attachServerListener() {
     if (!stateRef) return;
     stateRef.on('value', snap => {
@@ -151,7 +194,6 @@
       applyServerData(data);
     });
   }
-
   function loadFromServer() {
     if (!stateRef) return Promise.resolve();
     return stateRef.once('value').then(snap => {
@@ -161,7 +203,27 @@
   }
 
   // ============================================================
-  //  АВТОСБРОС (06:00 МСК)
+  //  ТРАНЗАКЦИИ НА ВЕСЬ УЗЕЛ daily / weekly
+  //  — единственный безопасный способ при смешанной структуре
+  // ============================================================
+  function txKind(kind, mutator) {
+    if (!stateRef) return Promise.resolve();
+    return stateRef.child(kind).transaction(curr => {
+      const base = (curr && typeof curr === 'object') ? curr : null;
+      // base === null означает «на сервере нет узла». Дадим mutator'у шанс решить.
+      const cleanItems = migrateItems(base ? base.items : null);
+      const result = mutator(base, cleanItems);
+      if (result === undefined) return; // cancel
+      // Собираем итоговый объект, сохраняя lastReset если был
+      const next = { items: result.items };
+      if (base && base.lastReset) next.lastReset = base.lastReset;
+      if (result.lastReset) next.lastReset = result.lastReset;
+      return next;
+    });
+  }
+
+  // ============================================================
+  //  АВТОСБРОС 06:00 МСК
   // ============================================================
   function autoReset() {
     const d = accountingDateKey();
@@ -183,43 +245,28 @@
 
   function enqueueAutoReset(kind, newKey) {
     if (!stateRef) return;
-    enqueueWrite(async () => {
-      await stateRef.child(kind).transaction(data => {
-        if (data && data.lastReset === newKey) return; // уже сброшено
-        const items = (data && data.items) || {};
-        Object.keys(items).forEach(id => {
-          if (items[id] && typeof items[id] === 'object') {
-            items[id].checked = false;
-          }
-        });
-        return { ...(data || {}), items, lastReset: newKey };
-      });
-    }, 'autoReset ' + kind);
+    enqueueWrite(() => txKind(kind, (base, items) => {
+      // Если узел уже с новым ключом — отменяем (кто-то сбросил раньше)
+      if (base && base.lastReset === newKey) return;
+      // Снимаем все галочки
+      Object.keys(items).forEach(id => { items[id].checked = false; });
+      return { items, lastReset: newKey };
+    }), 'autoReset ' + kind);
   }
 
   // ============================================================
   //  РЕНДЕР
   // ============================================================
-  // Непроверенные сверху (в исходном порядке), проверенные снизу.
-  function getSortedItems(kind) {
-    const items = state[kind].items || [];
-    const unchecked = [];
-    const checked = [];
-    for (const item of items) {
-      if (item.checked) checked.push(item);
-      else unchecked.push(item);
-    }
-    return unchecked.concat(checked);
-  }
-
   function renderChecklist(kind) {
-    const data = state[kind];
     const listEl = document.getElementById(kind + '-list');
     const infoEl = document.getElementById(kind + '-reset-info');
     if (!listEl || !infoEl) return;
     listEl.innerHTML = '';
 
-    const items = getSortedItems(kind);
+    const items = (state[kind].items || []).slice().sort((a, b) => {
+      if (a.checked !== b.checked) return a.checked ? 1 : -1;
+      return itemOrder(a) - itemOrder(b);
+    });
 
     if (items.length === 0) {
       const li = document.createElement('li');
@@ -264,56 +311,57 @@
   function renderAll() { renderChecklist('daily'); renderChecklist('weekly'); renderTotal(); }
 
   // ============================================================
-  //  ДЕЙСТВИЯ
+  //  ДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЯ
+  //  Каждое действие = transaction() на весь узел daily/weekly
   // ============================================================
   function addItem(kind, text) {
     if (!text) return;
     const item = {
       id: Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-      text, checked: false
+      text,
+      checked: false,
+      createdAt: Date.now()
     };
     if (!Array.isArray(state[kind].items)) state[kind].items = [];
     state[kind].items.push(item);
     renderChecklist(kind);
+
     if (stateRef) {
-      enqueueWrite(
-        () => stateRef.child(kind + '/items/' + item.id).set(item),
-        'addItem ' + kind + '/' + item.id
-      );
+      enqueueWrite(() => txKind(kind, (base, items) => {
+        items[item.id] = item;
+        return { items };
+      }), 'addItem ' + kind + '/' + item.id);
     }
   }
 
   function toggleItem(kind, id, checked) {
     const item = state[kind].items.find(i => i.id === id);
     if (!item) {
-      // Пункт уже удалён (например, другим пользователем) — тихо игнорируем.
-      // ВАЖНО: НЕ пишем в Firebase, иначе создастся фантомный { checked: true }.
-      console.warn('[app] toggleItem: item not found', kind, id);
+      // Пункт уже удалён другим пользователем — тихо игнорируем.
       return;
     }
     item.checked = checked;
-    // Мгновенный отклик + перестановка проверенных вниз
     renderChecklist(kind);
 
     if (stateRef) {
-      enqueueWrite(async () => {
-        await stateRef.child(kind + '/items/' + id).transaction(current => {
-          if (!current || typeof current !== 'object') return; // пункт удалён — отмена
-          current.checked = checked;
-          return current;
-        });
-      }, 'toggleItem ' + kind + '/' + id);
+      enqueueWrite(() => txKind(kind, (base, items) => {
+        if (!items[id]) return; // на сервере пункта нет — отмена (фантом не создаётся)
+        items[id].checked = checked;
+        return { items };
+      }), 'toggleItem ' + kind + '/' + id);
     }
   }
 
   function removeItem(kind, id) {
     state[kind].items = state[kind].items.filter(i => i.id !== id);
     renderChecklist(kind);
+
     if (stateRef) {
-      enqueueWrite(
-        () => stateRef.child(kind + '/items/' + id).remove(),
-        'removeItem ' + kind + '/' + id
-      );
+      enqueueWrite(() => txKind(kind, (base, items) => {
+        if (!items[id]) return;
+        delete items[id];
+        return { items };
+      }), 'removeItem ' + kind + '/' + id);
     }
   }
 
@@ -333,25 +381,53 @@
     state.expenses.total = 0;
     renderTotal();
     if (stateRef) {
-      enqueueWrite(
-        () => stateRef.child('expenses/total').set(0),
-        'resetDebt'
-      );
+      enqueueWrite(() => stateRef.child('expenses/total').set(0), 'resetDebt');
     }
   }
 
   // ============================================================
-  //  ТАЙМЕР АВТОСБРОСА
+  //  ЧИСТКА БД ОТ ФАНТОМОВ (однократно при загрузке)
+  // ============================================================
+  async function cleanupPhantoms() {
+    if (!stateRef) return;
+    try {
+      const snap = await stateRef.once('value');
+      const data = snap.val();
+      if (!data) return;
+
+      for (const kind of ['daily', 'weekly']) {
+        const raw = data[kind];
+        if (!raw || !raw.items) continue;
+        const items = raw.items;
+        const entries = Array.isArray(items)
+          ? items.map((v, i) => [String(i), v])
+          : Object.entries(items);
+
+        let needs = false;
+        for (const [key, val] of entries) {
+          if (!val || typeof val !== 'object') { needs = true; break; }
+          if (!val.id) { needs = true; break; }
+          if (!val.text) { needs = true; break; }
+          if (!/^\d+$/.test(key) && val.id !== key) { needs = true; break; }
+        }
+        if (!needs) continue;
+
+        enqueueWrite(() => txKind(kind, (base, cleanItems) => {
+          return { items: cleanItems }; // перезаписываем чистым объектом
+        }), 'cleanup ' + kind);
+      }
+    } catch (e) { console.warn('[app] cleanup:', e); }
+  }
+
+  // ============================================================
+  //  ТАЙМЕР
   // ============================================================
   let resetTimer = null;
   function scheduleReset() {
     if (resetTimer) clearTimeout(resetTimer);
     let delay = nextDailyResetUTC() - Date.now();
     if (delay < 0) delay = 1000;
-    resetTimer = setTimeout(() => {
-      autoReset();
-      scheduleReset();
-    }, delay + 500);
+    resetTimer = setTimeout(() => { autoReset(); scheduleReset(); }, delay + 500);
   }
 
   // ============================================================
@@ -385,24 +461,15 @@
 
     const d = document.getElementById('daily-input');
     if (d) d.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        const t = d.value.trim();
-        if (t) { addItem('daily', t); d.value = ''; }
-      }
+      if (e.key === 'Enter') { const t = d.value.trim(); if (t) { addItem('daily', t); d.value = ''; } }
     });
     const w = document.getElementById('weekly-input');
     if (w) w.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        const t = w.value.trim();
-        if (t) { addItem('weekly', t); w.value = ''; }
-      }
+      if (e.key === 'Enter') { const t = w.value.trim(); if (t) { addItem('weekly', t); w.value = ''; } }
     });
     const ex = document.getElementById('expense-input');
     if (ex) ex.addEventListener('keydown', e => {
-      if (e.key === 'Enter') {
-        const v = parseFloat(ex.value);
-        if (!isNaN(v) && v > 0) { addExpense(v); ex.value = ''; }
-      }
+      if (e.key === 'Enter') { const v = parseFloat(ex.value); if (!isNaN(v) && v > 0) { addExpense(v); ex.value = ''; } }
     });
   }
 
@@ -418,19 +485,15 @@
     if (stateRef) {
       await loadFromServer();
       attachServerListener();
+      await cleanupPhantoms();
     }
 
     autoReset();
 
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && stateRef) {
-        loadFromServer().then(autoReset);
-      }
+      if (!document.hidden && stateRef) loadFromServer().then(autoReset);
     });
-    setInterval(() => {
-      renderChecklist('daily');
-      renderChecklist('weekly');
-    }, 60 * 1000);
+    setInterval(() => { renderChecklist('daily'); renderChecklist('weekly'); }, 60 * 1000);
     setInterval(autoReset, 60 * 1000);
 
     scheduleReset();
