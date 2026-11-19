@@ -26,7 +26,6 @@
   const RESET_HOUR_MSK = 6;
   const SHIFT_MS = (MSK_OFFSET_MIN - RESET_HOUR_MSK * 60) * 60 * 1000;
 
-  // ---------- State ----------
   let state = defaultState();
 
   function defaultState() {
@@ -88,7 +87,7 @@
   }
 
   // ============================================================
-  //  WRITE QUEUE — все операции идут последовательно
+  //  WRITE QUEUE
   // ============================================================
   const writeQueue = [];
   let isProcessingQueue = false;
@@ -121,9 +120,6 @@
       }
     } finally {
       isProcessingQueue = false;
-      // Финальная синхронизация: забираем актуальные данные с сервера.
-      // Нужно потому, что во время обработки очереди мы пропускали
-      // события realtime-листенера, чтобы не затирать локальные оптимистичные изменения.
       if (stateRef) {
         try {
           const snap = await stateRef.once('value');
@@ -134,7 +130,7 @@
   }
 
   // ============================================================
-  //  REALTIME SYNC (Firebase → локальный state)
+  //  REALTIME SYNC
   // ============================================================
   let lastAppliedJson = '';
 
@@ -149,8 +145,6 @@
   function attachServerListener() {
     if (!stateRef) return;
     stateRef.on('value', snap => {
-      // Пока идут локальные записи — не трогаем state,
-      // иначе затрём оптимистичные изменения пользователя.
       if (isProcessingQueue || writeQueue.length > 0) return;
       const data = snap.val();
       if (!data) return;
@@ -167,7 +161,7 @@
   }
 
   // ============================================================
-  //  АВТОСБРОС (06:00 МСК) — через transaction
+  //  АВТОСБРОС (06:00 МСК)
   // ============================================================
   function autoReset() {
     const d = accountingDateKey();
@@ -191,15 +185,14 @@
     if (!stateRef) return;
     enqueueWrite(async () => {
       await stateRef.child(kind).transaction(data => {
-        // Если на сервере уже новый ключ — ничего не делаем
-        if (data && data.lastReset === newKey) return; // undefined = отмена
+        if (data && data.lastReset === newKey) return; // уже сброшено
         const items = (data && data.items) || {};
         Object.keys(items).forEach(id => {
           if (items[id] && typeof items[id] === 'object') {
             items[id].checked = false;
           }
         });
-        return { items, lastReset: newKey };
+        return { ...(data || {}), items, lastReset: newKey };
       });
     }, 'autoReset ' + kind);
   }
@@ -207,6 +200,18 @@
   // ============================================================
   //  РЕНДЕР
   // ============================================================
+  // Непроверенные сверху (в исходном порядке), проверенные снизу.
+  function getSortedItems(kind) {
+    const items = state[kind].items || [];
+    const unchecked = [];
+    const checked = [];
+    for (const item of items) {
+      if (item.checked) checked.push(item);
+      else unchecked.push(item);
+    }
+    return unchecked.concat(checked);
+  }
+
   function renderChecklist(kind) {
     const data = state[kind];
     const listEl = document.getElementById(kind + '-list');
@@ -214,13 +219,15 @@
     if (!listEl || !infoEl) return;
     listEl.innerHTML = '';
 
-    if (!data.items || data.items.length === 0) {
+    const items = getSortedItems(kind);
+
+    if (items.length === 0) {
       const li = document.createElement('li');
       li.className = 'empty-msg';
       li.textContent = 'Пунктов пока нет';
       listEl.appendChild(li);
     } else {
-      data.items.forEach(item => {
+      items.forEach(item => {
         const li = document.createElement('li');
         const cb = document.createElement('input');
         cb.type = 'checkbox';
@@ -257,7 +264,7 @@
   function renderAll() { renderChecklist('daily'); renderChecklist('weekly'); renderTotal(); }
 
   // ============================================================
-  //  ДЕЙСТВИЯ — каждая операция = только точечный путь в Firebase
+  //  ДЕЙСТВИЯ
   // ============================================================
   function addItem(kind, text) {
     if (!text) return;
@@ -265,11 +272,9 @@
       id: Date.now() + '_' + Math.random().toString(36).slice(2, 7),
       text, checked: false
     };
-    // 1) Оптимистично обновляем UI
     if (!Array.isArray(state[kind].items)) state[kind].items = [];
     state[kind].items.push(item);
     renderChecklist(kind);
-    // 2) Ставим в очередь точечную запись (никакой перезаписи всего дерева)
     if (stateRef) {
       enqueueWrite(
         () => stateRef.child(kind + '/items/' + item.id).set(item),
@@ -280,12 +285,24 @@
 
   function toggleItem(kind, id, checked) {
     const item = state[kind].items.find(i => i.id === id);
-    if (item) item.checked = checked;
+    if (!item) {
+      // Пункт уже удалён (например, другим пользователем) — тихо игнорируем.
+      // ВАЖНО: НЕ пишем в Firebase, иначе создастся фантомный { checked: true }.
+      console.warn('[app] toggleItem: item not found', kind, id);
+      return;
+    }
+    item.checked = checked;
+    // Мгновенный отклик + перестановка проверенных вниз
+    renderChecklist(kind);
+
     if (stateRef) {
-      enqueueWrite(
-        () => stateRef.child(kind + '/items/' + id + '/checked').set(checked),
-        'toggleItem ' + kind + '/' + id
-      );
+      enqueueWrite(async () => {
+        await stateRef.child(kind + '/items/' + id).transaction(current => {
+          if (!current || typeof current !== 'object') return; // пункт удалён — отмена
+          current.checked = checked;
+          return current;
+        });
+      }, 'toggleItem ' + kind + '/' + id);
     }
   }
 
@@ -301,11 +318,8 @@
   }
 
   function addExpense(amount) {
-    // Оптимистично
     state.expenses.total = (Number(state.expenses.total) || 0) + amount;
     renderTotal();
-    // Атомарное прибавление через transaction —
-    // два одновременных addExpense от разных пользователей НЕ потеряются
     if (stateRef) {
       enqueueWrite(
         () => stateRef.child('expenses/total').transaction(v => (Number(v) || 0) + amount),
@@ -393,26 +407,21 @@
   }
 
   async function init() {
-    // 1) локальный кеш — мгновенный отклик
     try {
       const raw = localStorage.getItem('accounting_app_v1');
       if (raw) state = normalizeState(JSON.parse(raw));
     } catch (e) {}
     renderAll();
 
-    // 2) сразу привязываем кнопки
     attachListeners();
 
-    // 3) синхронизация с сервером
     if (stateRef) {
       await loadFromServer();
       attachServerListener();
     }
 
-    // 4) проверка автосброса — ПОСЛЕ получения актуального lastReset
     autoReset();
 
-    // 5) периодические проверки
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && stateRef) {
         loadFromServer().then(autoReset);
