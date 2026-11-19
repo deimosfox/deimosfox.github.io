@@ -10,7 +10,6 @@
 <div class="container">
   <h1>R2 Учет</h1>
 
-  <!-- Дневной чек-лист -->
   <div class="card">
     <h2>
       Ежедневный чек-лист
@@ -23,7 +22,6 @@
     </div>
   </div>
 
-  <!-- Недельный чек-лист -->
   <div class="card">
     <h2>
       Недельный чек-лист
@@ -36,22 +34,30 @@
     </div>
   </div>
 
-  <!-- Учет трат -->
   <div class="card">
     <h2>Учет трат</h2>
     <div class="expense-row">
-      <input type="number" id="expense-input" placeholder="Потрачено на расходники" min="0" step="0.01">
+      <select id="expense-person" class="expense-select" title="Кто потратил">
+        <option value="ArhonDD">ArhonDD</option>
+        <option value="eMachines">eMachines</option>
+        <option value="Asta">Asta</option>
+      </select>
+      <input type="number" id="expense-input" placeholder="Сумма, ₽" min="0" step="0.01">
       <button class="btn btn-primary" id="expense-add">Добавить</button>
     </div>
+
     <div class="total-box">
       <span class="label">Итого потрачено:</span>
       <span class="value" id="total-value">0</span>
     </div>
+
+    <div class="debts-label">Кому сколько нужно передать другим участникам:</div>
+    <div class="debts-grid" id="debts-grid"></div>
+
     <button class="btn btn-danger" id="reset-debt">Обнулить долг</button>
   </div>
 </div>
 
-<!-- Firebase SDK (compat-версия для простой интеграции) -->
 <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
 <script src="app.js"></script>

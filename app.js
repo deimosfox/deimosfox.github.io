@@ -12,15 +12,21 @@
     measurementId: "G-4ETB2HXY4Z"
   };
 
+  const PARTICIPANTS = ['ArhonDD', 'eMachines', 'Asta'];
+  const PERSON_KEY = 'expense_person_v1';
+
+  // ---------- Firebase ----------
   let stateRef = null;
   try {
     if (typeof firebase !== 'undefined') {
       firebase.initializeApp(firebaseConfig);
       stateRef = firebase.database().ref('accounting_state');
+    } else {
+      console.warn('[app] Firebase SDK не загружен');
     }
   } catch (e) { console.warn('[app] Firebase:', e); }
 
-  // Сброс в 06:00 МСК
+  // ---------- Сброс в 06:00 МСК ----------
   const MSK_OFFSET_MIN = 3 * 60;
   const RESET_HOUR_MSK = 6;
   const SHIFT_MS = (MSK_OFFSET_MIN - RESET_HOUR_MSK * 60) * 60 * 1000;
@@ -31,15 +37,14 @@
     return {
       daily: { items: [], lastReset: null },
       weekly: { items: [], lastReset: null },
-      expenses: { total: 0 }
+      expenses: {
+        total: 0,
+        contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
+      }
     };
   }
 
-  // ============================================================
-  //  НОРМАЛИЗАЦИЯ ДАННЫХ ИЗ FIREBASE
-  //  Приводит любую «грязь» (массивы, фантомы, смешанные ключи)
-  //  к чистому объекту { id: { id, text, checked, createdAt? } }
-  // ============================================================
+  // ---------- Нормализация ----------
   function migrateItems(raw) {
     if (!raw) return {};
     const entries = Array.isArray(raw)
@@ -48,18 +53,12 @@
     const out = {};
     for (const [key, val] of entries) {
       if (!val || typeof val !== 'object') continue;
-      // Фантом: нет id. Пытаемся взять id из ключа, если ключ не числовой.
       let id = val.id;
       if (!id) {
-        const keyIsNumeric = /^\d+$/.test(key);
-        if (!keyIsNumeric) id = key; // ключ = id (нормальный случай)
-        // Если ключ числовой и id нет — это битые данные, дропаем.
+        if (!/^\d+$/.test(key)) id = key;
       }
       if (!id) continue;
-      if (!val.text || typeof val.text !== 'string') {
-        // Фантом с id, но без текста — тоже дропаем (там нет полезной информации).
-        continue;
-      }
+      if (!val.text || typeof val.text !== 'string') continue;
       out[id] = {
         id: id,
         text: val.text,
@@ -94,14 +93,23 @@
       out[kind].items = itemsToSortedArray(migrateItems(src.items));
       if (src.lastReset) out[kind].lastReset = src.lastReset;
     });
-    if (raw.expenses && typeof raw.expenses.total === 'number')
-      out.expenses.total = raw.expenses.total;
+    if (raw.expenses && typeof raw.expenses === 'object') {
+      if (typeof raw.expenses.total === 'number') {
+        out.expenses.total = raw.expenses.total;
+      }
+      if (raw.expenses.contributions && typeof raw.expenses.contributions === 'object') {
+        for (const p of PARTICIPANTS) {
+          const v = raw.expenses.contributions[p];
+          if (typeof v === 'number' && isFinite(v)) {
+            out.expenses.contributions[p] = v;
+          }
+        }
+      }
+    }
     return out;
   }
 
-  // ============================================================
-  //  ВРЕМЯ (06:00 МСК)
-  // ============================================================
+  // ---------- Время (06:00 МСК) ----------
   function shiftedNow() { return new Date(Date.now() + SHIFT_MS); }
   function accountingDateKey() {
     const d = shiftedNow();
@@ -135,15 +143,31 @@
            p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ' МСК';
   }
 
+  // ---------- Форматирование чисел ----------
+  function fmtMoney(n) {
+    const v = Number(n) || 0;
+    if (Number.isInteger(v)) return v.toLocaleString('ru-RU');
+    return v.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+  }
+
   // ============================================================
-  //  WRITE QUEUE
+  //  WRITE QUEUE (с таймаутом на операцию)
   // ============================================================
   const writeQueue = [];
   let isProcessingQueue = false;
+  const OP_TIMEOUT_MS = 15000;
 
   function enqueueWrite(fn, description) {
     writeQueue.push({ fn, description });
     if (!isProcessingQueue) processQueue();
+  }
+
+  function withTimeout(promise, ms) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout ' + ms + 'ms')), ms))
+    ]);
   }
 
   async function processQueue() {
@@ -153,14 +177,18 @@
       while (writeQueue.length > 0) {
         const item = writeQueue[0];
         let ok = false;
-        for (let attempt = 1; attempt <= 5; attempt++) {
-          try { await item.fn(); ok = true; break; }
-          catch (e) {
-            console.warn('[app] attempt', attempt, 'failed:', item.description, e);
-            if (attempt < 5) await new Promise(r => setTimeout(r, attempt * 700));
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            await withTimeout(Promise.resolve(item.fn()), OP_TIMEOUT_MS);
+            ok = true;
+            console.log('[app] OK:', item.description);
+            break;
+          } catch (e) {
+            console.warn('[app] attempt', attempt, 'failed:', item.description, e && e.message);
+            if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 500));
           }
         }
-        if (!ok) console.error('[app] giving up:', item.description);
+        if (!ok) console.error('[app] GIVE UP:', item.description);
         writeQueue.shift();
       }
     } finally {
@@ -203,18 +231,15 @@
   }
 
   // ============================================================
-  //  ТРАНЗАКЦИИ НА ВЕСЬ УЗЕЛ daily / weekly
-  //  — единственный безопасный способ при смешанной структуре
+  //  ТРАНЗАКЦИИ на узел daily / weekly
   // ============================================================
   function txKind(kind, mutator) {
     if (!stateRef) return Promise.resolve();
     return stateRef.child(kind).transaction(curr => {
       const base = (curr && typeof curr === 'object') ? curr : null;
-      // base === null означает «на сервере нет узла». Дадим mutator'у шанс решить.
       const cleanItems = migrateItems(base ? base.items : null);
       const result = mutator(base, cleanItems);
-      if (result === undefined) return; // cancel
-      // Собираем итоговый объект, сохраняя lastReset если был
+      if (result === undefined) return;
       const next = { items: result.items };
       if (base && base.lastReset) next.lastReset = base.lastReset;
       if (result.lastReset) next.lastReset = result.lastReset;
@@ -228,7 +253,6 @@
   function autoReset() {
     const d = accountingDateKey();
     const w = accountingWeekKey();
-
     if (state.daily.lastReset !== d) {
       state.daily.items = state.daily.items.map(i => ({ ...i, checked: false }));
       state.daily.lastReset = d;
@@ -246,16 +270,14 @@
   function enqueueAutoReset(kind, newKey) {
     if (!stateRef) return;
     enqueueWrite(() => txKind(kind, (base, items) => {
-      // Если узел уже с новым ключом — отменяем (кто-то сбросил раньше)
       if (base && base.lastReset === newKey) return;
-      // Снимаем все галочки
       Object.keys(items).forEach(id => { items[id].checked = false; });
       return { items, lastReset: newKey };
     }), 'autoReset ' + kind);
   }
 
   // ============================================================
-  //  РЕНДЕР
+  //  РЕНДЕР чек-листов
   // ============================================================
   function renderChecklist(kind) {
     const listEl = document.getElementById(kind + '-list');
@@ -302,30 +324,67 @@
       : 'сброс: ' + fmtMsk(nextWeeklyResetUTC());
   }
 
+  // ============================================================
+  //  РЕНДЕР расходов
+  // ============================================================
   function renderTotal() {
-    const total = Number(state.expenses.total) || 0;
     const el = document.getElementById('total-value');
-    if (el) el.textContent = total.toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+    if (el) el.textContent = fmtMoney(state.expenses.total);
   }
 
-  function renderAll() { renderChecklist('daily'); renderChecklist('weekly'); renderTotal(); }
+  function computeDebts() {
+    const total = Number(state.expenses.total) || 0;
+    const fair = Math.ceil(total / 3);
+    return PARTICIPANTS.map(name => {
+      const contributed = Number(state.expenses.contributions[name]) || 0;
+      const owes = Math.max(0, fair - contributed);
+      return { name, contributed, owes, fair };
+    });
+  }
+
+  function renderDebts() {
+    const grid = document.getElementById('debts-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    const debts = computeDebts();
+    debts.forEach(d => {
+      const block = document.createElement('div');
+      block.className = 'debt-block' + (d.owes === 0 ? ' zero' : '');
+      const amountEl = document.createElement('div');
+      amountEl.className = 'debt-amount';
+      amountEl.textContent = d.owes === 0 ? '0 ₽' : fmtMoney(d.owes) + ' ₽';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'debt-name';
+      nameEl.textContent = d.name;
+      const hintEl = document.createElement('div');
+      hintEl.className = 'debt-hint';
+      hintEl.innerHTML = 'вложил <b>' + fmtMoney(d.contributed) + ' ₽</b><br>доля <b>' + fmtMoney(d.fair) + ' ₽</b>';
+      block.appendChild(nameEl);
+      block.appendChild(amountEl);
+      block.appendChild(hintEl);
+      grid.appendChild(block);
+    });
+  }
+
+  function renderAll() {
+    renderChecklist('daily');
+    renderChecklist('weekly');
+    renderTotal();
+    renderDebts();
+  }
 
   // ============================================================
-  //  ДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЯ
-  //  Каждое действие = transaction() на весь узел daily/weekly
+  //  ДЕЙСТВИЯ: чек-листы
   // ============================================================
   function addItem(kind, text) {
     if (!text) return;
     const item = {
       id: Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-      text,
-      checked: false,
-      createdAt: Date.now()
+      text, checked: false, createdAt: Date.now()
     };
     if (!Array.isArray(state[kind].items)) state[kind].items = [];
     state[kind].items.push(item);
     renderChecklist(kind);
-
     if (stateRef) {
       enqueueWrite(() => txKind(kind, (base, items) => {
         items[item.id] = item;
@@ -336,16 +395,12 @@
 
   function toggleItem(kind, id, checked) {
     const item = state[kind].items.find(i => i.id === id);
-    if (!item) {
-      // Пункт уже удалён другим пользователем — тихо игнорируем.
-      return;
-    }
+    if (!item) return;
     item.checked = checked;
     renderChecklist(kind);
-
     if (stateRef) {
       enqueueWrite(() => txKind(kind, (base, items) => {
-        if (!items[id]) return; // на сервере пункта нет — отмена (фантом не создаётся)
+        if (!items[id]) return;
         items[id].checked = checked;
         return { items };
       }), 'toggleItem ' + kind + '/' + id);
@@ -355,7 +410,6 @@
   function removeItem(kind, id) {
     state[kind].items = state[kind].items.filter(i => i.id !== id);
     renderChecklist(kind);
-
     if (stateRef) {
       enqueueWrite(() => txKind(kind, (base, items) => {
         if (!items[id]) return;
@@ -365,28 +419,50 @@
     }
   }
 
-  function addExpense(amount) {
+  // ============================================================
+  //  ДЕЙСТВИЯ: расходы (единая транзакция на узел expenses)
+  // ============================================================
+  function addExpense(person, amount) {
+    if (!PARTICIPANTS.includes(person)) return;
+    if (!(amount > 0)) return;
+
+    // Оптимистично
     state.expenses.total = (Number(state.expenses.total) || 0) + amount;
+    state.expenses.contributions[person] =
+      (Number(state.expenses.contributions[person]) || 0) + amount;
     renderTotal();
+    renderDebts();
+
     if (stateRef) {
-      enqueueWrite(
-        () => stateRef.child('expenses/total').transaction(v => (Number(v) || 0) + amount),
-        'addExpense +' + amount
-      );
+      enqueueWrite(() => stateRef.child('expenses').transaction(curr => {
+        const base = (curr && typeof curr === 'object') ? curr : {};
+        const total = (Number(base.total) || 0) + amount;
+        const contribs = Object.assign(
+          { ArhonDD: 0, eMachines: 0, Asta: 0 },
+          base.contributions || {}
+        );
+        contribs[person] = (Number(contribs[person]) || 0) + amount;
+        return { total, contributions: contribs };
+      }), 'addExpense ' + person + ' +' + amount);
     }
   }
 
   function resetDebt() {
     if (!confirm('Обнулить долг? Это действие нельзя отменить.')) return;
     state.expenses.total = 0;
+    state.expenses.contributions = { ArhonDD: 0, eMachines: 0, Asta: 0 };
     renderTotal();
+    renderDebts();
     if (stateRef) {
-      enqueueWrite(() => stateRef.child('expenses/total').set(0), 'resetDebt');
+      enqueueWrite(() => stateRef.child('expenses').set({
+        total: 0,
+        contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
+      }), 'resetDebt');
     }
   }
 
   // ============================================================
-  //  ЧИСТКА БД ОТ ФАНТОМОВ (однократно при загрузке)
+  //  ЧИСТКА фантомов (не блокирует пользовательские действия)
   // ============================================================
   async function cleanupPhantoms() {
     if (!stateRef) return;
@@ -406,14 +482,15 @@
         let needs = false;
         for (const [key, val] of entries) {
           if (!val || typeof val !== 'object') { needs = true; break; }
-          if (!val.id) { needs = true; break; }
-          if (!val.text) { needs = true; break; }
-          if (!/^\d+$/.test(key) && val.id !== key) { needs = true; break; }
+          if (/^\d+$/.test(key)) { needs = true; break; }     // numeric key = legacy
+          if (!val.id || !val.text) { needs = true; break; }   // phantom
+          if (val.id !== key) { needs = true; break; }         // key mismatch
         }
         if (!needs) continue;
 
+        console.log('[app] cleanup needed for', kind);
         enqueueWrite(() => txKind(kind, (base, cleanItems) => {
-          return { items: cleanItems }; // перезаписываем чистым объектом
+          return { items: cleanItems };
         }), 'cleanup ' + kind);
       }
     } catch (e) { console.warn('[app] cleanup:', e); }
@@ -431,13 +508,24 @@
   }
 
   // ============================================================
-  //  ОБРАБОТЧИКИ И ИНИЦИАЛИЗАЦИЯ
+  //  ИНИЦИАЛИЗАЦИЯ
   // ============================================================
+  function getPerson() {
+    const sel = document.getElementById('expense-person');
+    return sel ? sel.value : 'ArhonDD';
+  }
+  function setPerson(p) {
+    const sel = document.getElementById('expense-person');
+    if (!sel) return;
+    if (PARTICIPANTS.includes(p)) sel.value = p;
+  }
+
   function attachListeners() {
     const bind = (id, fn) => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('click', fn);
     };
+
     bind('daily-add', () => {
       const inp = document.getElementById('daily-input');
       if (!inp) return;
@@ -454,8 +542,12 @@
       const inp = document.getElementById('expense-input');
       if (!inp) return;
       const v = parseFloat(inp.value);
-      if (!isNaN(v) && v > 0) { addExpense(v); inp.value = ''; }
-      else inp.focus();
+      if (!isNaN(v) && v > 0) {
+        addExpense(getPerson(), v);
+        inp.value = '';
+      } else {
+        inp.focus();
+      }
     });
     bind('reset-debt', resetDebt);
 
@@ -469,8 +561,23 @@
     });
     const ex = document.getElementById('expense-input');
     if (ex) ex.addEventListener('keydown', e => {
-      if (e.key === 'Enter') { const v = parseFloat(ex.value); if (!isNaN(v) && v > 0) { addExpense(v); ex.value = ''; } }
+      if (e.key === 'Enter') {
+        const v = parseFloat(ex.value);
+        if (!isNaN(v) && v > 0) { addExpense(getPerson(), v); ex.value = ''; }
+      }
     });
+
+    // Запоминаем выбранного участника
+    const sel = document.getElementById('expense-person');
+    if (sel) {
+      try {
+        const saved = localStorage.getItem(PERSON_KEY);
+        if (saved && PARTICIPANTS.includes(saved)) sel.value = saved;
+      } catch (e) {}
+      sel.addEventListener('change', () => {
+        try { localStorage.setItem(PERSON_KEY, sel.value); } catch (e) {}
+      });
+    }
   }
 
   async function init() {
@@ -479,13 +586,14 @@
       if (raw) state = normalizeState(JSON.parse(raw));
     } catch (e) {}
     renderAll();
-
     attachListeners();
 
     if (stateRef) {
       await loadFromServer();
       attachServerListener();
-      await cleanupPhantoms();
+      // Очистка идёт в фоне; пользователь может работать параллельно,
+      // потому что очередь операций последовательна, а таймаут не даёт «залипнуть».
+      cleanupPhantoms();
     }
 
     autoReset();

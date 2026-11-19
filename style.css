@@ -183,6 +183,7 @@ h1::after {
   display: flex;
   gap: 10px;
 }
+
 .add-row input[type="text"],
 .expense-row input[type="number"] {
   flex: 1;
@@ -205,6 +206,42 @@ h1::after {
   border-color: #8a6e3a;
   box-shadow: 0 0 12px rgba(184, 148, 62, 0.15), inset 0 0 8px rgba(0,0,0,0.5);
   background: #0e0d10;
+}
+
+/* Селектор "кто потратил" */
+.expense-select {
+  padding: 10px 14px;
+  background: #0c0b0e;
+  border: 1px solid #2e2418;
+  border-radius: 4px;
+  font-size: 14px;
+  color: #d4b878;
+  font-family: 'Roboto Condensed', sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  min-width: 130px;
+  transition: all 0.2s;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, #8a6e3a 50%),
+                    linear-gradient(135deg, #8a6e3a 50%, transparent 50%);
+  background-position: calc(100% - 16px) center, calc(100% - 11px) center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 30px;
+}
+.expense-select:hover {
+  border-color: #8a6e3a;
+}
+.expense-select:focus {
+  outline: none;
+  border-color: #b8943e;
+  box-shadow: 0 0 12px rgba(184, 148, 62, 0.2);
+}
+.expense-select option {
+  background: #16151a;
+  color: #d4b878;
 }
 
 .btn {
@@ -258,7 +295,7 @@ h1::after {
   flex-wrap: wrap;
 }
 .expense-row input[type="number"] {
-  min-width: 140px;
+  min-width: 120px;
 }
 
 .total-box {
@@ -289,6 +326,68 @@ h1::after {
   text-shadow: 0 0 16px rgba(232, 192, 96, 0.4), 0 2px 4px rgba(0,0,0,0.6);
 }
 
+/* Блоки "кому сколько передать" */
+.debts-label {
+  font-family: 'Cinzel', serif;
+  font-size: 12px;
+  color: #a09078;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed #2e2418;
+}
+.debts-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.debt-block {
+  background: linear-gradient(135deg, #14120e 0%, #1a1610 100%);
+  border: 1px solid #3a2e1e;
+  border-radius: 4px;
+  padding: 14px 10px;
+  text-align: center;
+  box-shadow: inset 0 1px 0 rgba(200, 160, 80, 0.06), inset 0 -1px 0 rgba(0,0,0,0.5);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.debt-block.zero {
+  border-color: #2a3e2a;
+  box-shadow: inset 0 1px 0 rgba(100, 160, 80, 0.06), inset 0 -1px 0 rgba(0,0,0,0.5);
+}
+.debt-name {
+  font-family: 'Cinzel', serif;
+  font-size: 12px;
+  font-weight: 600;
+  color: #a09078;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.debt-amount {
+  font-family: 'Cinzel', serif;
+  font-size: 20px;
+  font-weight: 700;
+  color: #e8c060;
+  text-shadow: 0 0 12px rgba(232, 192, 96, 0.35), 0 1px 2px rgba(0,0,0,0.6);
+  margin-bottom: 6px;
+  line-height: 1.2;
+}
+.debt-block.zero .debt-amount {
+  color: #8ac06a;
+  text-shadow: 0 0 12px rgba(138, 192, 106, 0.35), 0 1px 2px rgba(0,0,0,0.6);
+}
+.debt-hint {
+  font-size: 11px;
+  color: #6a5a48;
+  letter-spacing: 0.2px;
+}
+.debt-hint b {
+  color: #a09078;
+  font-weight: 400;
+}
+
 .empty-msg {
   color: #4a4040;
   font-size: 13px;
@@ -301,4 +400,7 @@ h1::after {
   .add-row { flex-direction: column; }
   .btn { width: 100%; }
   h1 { font-size: 22px; }
+  .expense-row { flex-direction: column; align-items: stretch; }
+  .expense-select { width: 100%; }
+  .debts-grid { grid-template-columns: 1fr; }
 }
