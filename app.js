@@ -12,30 +12,23 @@
     measurementId: "G-4ETB2HXY4Z"
   };
 
-  // ---------- Инициализация Firebase ----------
+  // ---------- Firebase ----------
   let stateRef = null;
   try {
     if (typeof firebase !== 'undefined') {
       firebase.initializeApp(firebaseConfig);
       stateRef = firebase.database().ref('accounting_state');
-    } else {
-      console.warn('[app] Firebase SDK не загружен — работаем локально');
     }
-  } catch (e) {
-    console.warn('[app] Ошибка Firebase:', e);
-    stateRef = null;
-  }
+  } catch (e) { console.warn('[app] Firebase:', e); }
 
   // ---------- Сброс в 06:00 МСК ----------
-  const MSK_OFFSET_MIN = 3 * 60;        // UTC+3
-  const RESET_HOUR_MSK = 6;             // ← было 5
-  const RESET_MSK_MINUTES = RESET_HOUR_MSK * 60;
-  // Сдвиг = (UTC+3) − 06:00 = −3 часа
-  const SHIFT_MS = (MSK_OFFSET_MIN - RESET_MSK_MINUTES) * 60 * 1000;
+  const MSK_OFFSET_MIN = 3 * 60;
+  const RESET_HOUR_MSK = 6;
+  const SHIFT_MS = (MSK_OFFSET_MIN - RESET_HOUR_MSK * 60) * 60 * 1000;
 
+  // ---------- State ----------
   let state = defaultState();
 
-  // ---------- Нормализация ----------
   function defaultState() {
     return {
       daily: { items: [], lastReset: null },
@@ -47,121 +40,173 @@
   function normalizeState(raw) {
     const out = defaultState();
     if (!raw || typeof raw !== 'object') return out;
-
     ['daily', 'weekly'].forEach(kind => {
       const src = raw[kind];
       if (!src) return;
-      if (Array.isArray(src.items)) {
-        out[kind].items = src.items;
-      } else if (src.items && typeof src.items === 'object') {
+      if (Array.isArray(src.items)) out[kind].items = src.items;
+      else if (src.items && typeof src.items === 'object')
         out[kind].items = Object.values(src.items);
-      }
       if (src.lastReset) out[kind].lastReset = src.lastReset;
     });
-
-    if (raw.expenses && typeof raw.expenses.total === 'number') {
+    if (raw.expenses && typeof raw.expenses.total === 'number')
       out.expenses.total = raw.expenses.total;
-    }
     return out;
   }
 
   // ---------- Время (06:00 МСК) ----------
   function shiftedNow() { return new Date(Date.now() + SHIFT_MS); }
-
   function accountingDateKey() {
     const d = shiftedNow();
     return d.getUTCFullYear() + '-' +
-           String(d.getUTCMonth() + 1).padStart(2, '0') + '-' +
-           String(d.getUTCDate()).padStart(2, '0');
+      String(d.getUTCMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getUTCDate()).padStart(2, '0');
   }
-
   function accountingWeekKey() {
     const d = shiftedNow();
-    const target = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-    const dayNr = (target.getUTCDay() + 6) % 7;
-    target.setUTCDate(target.getUTCDate() - dayNr + 3);
-    const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
-    const week = 1 + Math.round((target - firstThursday) / (7 * 24 * 3600 * 1000));
-    return target.getUTCFullYear() + '-W' + String(week).padStart(2, '0');
+    const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+    const dayNr = (t.getUTCDay() + 6) % 7;
+    t.setUTCDate(t.getUTCDate() - dayNr + 3);
+    const firstThu = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+    const week = 1 + Math.round((t - firstThu) / (7 * 24 * 3600 * 1000));
+    return t.getUTCFullYear() + '-W' + String(week).padStart(2, '0');
   }
-
   function nextDailyResetUTC() {
-    const now = Date.now();
-    const s = new Date(now + SHIFT_MS);
+    const s = shiftedNow();
     return Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + 1) - SHIFT_MS;
   }
-
   function nextWeeklyResetUTC() {
-    const now = Date.now();
-    const s = new Date(now + SHIFT_MS);
+    const s = shiftedNow();
     const dayNr = (s.getUTCDay() + 6) % 7;
-    let daysToMonday = (7 - dayNr) % 7;
-    if (daysToMonday === 0) daysToMonday = 7;
-    return Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + daysToMonday) - SHIFT_MS;
+    let d = (7 - dayNr) % 7; if (d === 0) d = 7;
+    return Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate() + d) - SHIFT_MS;
   }
-
   function fmtMsk(utcMs) {
     const d = new Date(utcMs + 3 * 60 * 60 * 1000);
-    const pad = n => String(n).padStart(2, '0');
-    return pad(d.getUTCDate()) + '.' + pad(d.getUTCMonth() + 1) + ' ' +
-           pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ' МСК';
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getUTCDate()) + '.' + p(d.getUTCMonth() + 1) + ' ' +
+           p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ' МСК';
   }
 
-  // ---------- Синхронизация ----------
-  let isSyncing = false;
-  let pendingSave = false;
-  let lastServerJson = '';
+  // ============================================================
+  //  WRITE QUEUE — все операции идут последовательно
+  // ============================================================
+  const writeQueue = [];
+  let isProcessingQueue = false;
+
+  function enqueueWrite(fn, description) {
+    writeQueue.push({ fn, description, createdAt: Date.now() });
+    if (!isProcessingQueue) processQueue();
+  }
+
+  async function processQueue() {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
+    try {
+      while (writeQueue.length > 0) {
+        const item = writeQueue[0];
+        let succeeded = false;
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          try {
+            await item.fn();
+            succeeded = true;
+            break;
+          } catch (e) {
+            console.warn('[app] Write attempt ' + attempt + ' failed:',
+              item.description, e);
+            if (attempt < 5) await new Promise(r => setTimeout(r, attempt * 800));
+          }
+        }
+        if (!succeeded) console.error('[app] Giving up on:', item.description);
+        writeQueue.shift();
+      }
+    } finally {
+      isProcessingQueue = false;
+      // Финальная синхронизация: забираем актуальные данные с сервера.
+      // Нужно потому, что во время обработки очереди мы пропускали
+      // события realtime-листенера, чтобы не затирать локальные оптимистичные изменения.
+      if (stateRef) {
+        try {
+          const snap = await stateRef.once('value');
+          if (snap && snap.val()) applyServerData(snap.val());
+        } catch (e) { console.warn('[app] Final sync:', e); }
+      }
+    }
+  }
+
+  // ============================================================
+  //  REALTIME SYNC (Firebase → локальный state)
+  // ============================================================
+  let lastAppliedJson = '';
+
+  function applyServerData(data) {
+    const json = JSON.stringify(data);
+    if (json === lastAppliedJson) return;
+    state = normalizeState(data);
+    lastAppliedJson = json;
+    renderAll();
+  }
+
+  function attachServerListener() {
+    if (!stateRef) return;
+    stateRef.on('value', snap => {
+      // Пока идут локальные записи — не трогаем state,
+      // иначе затрём оптимистичные изменения пользователя.
+      if (isProcessingQueue || writeQueue.length > 0) return;
+      const data = snap.val();
+      if (!data) return;
+      applyServerData(data);
+    });
+  }
 
   function loadFromServer() {
     if (!stateRef) return Promise.resolve();
     return stateRef.once('value').then(snap => {
       const data = snap.val();
-      if (data) {
-        state = normalizeState(data);
-        lastServerJson = JSON.stringify(data);
-        renderAll();
-      }
+      if (data) applyServerData(data);
     }).catch(e => console.warn('[app] load:', e));
   }
 
-  function saveToServer() {
-    if (!stateRef) return;
-    if (isSyncing) { pendingSave = true; return; }
-    isSyncing = true;
-    stateRef.set(state)
-      .then(() => { lastServerJson = JSON.stringify(state); })
-      .catch(e => console.warn('[app] save:', e))
-      .finally(() => {
-        isSyncing = false;
-        if (pendingSave) { pendingSave = false; saveToServer(); }
-      });
-  }
-
-  function save() {
-    try { localStorage.setItem('accounting_app_v1', JSON.stringify(state)); } catch (e) {}
-    saveToServer();
-  }
-
-  // ---------- Автосброс ----------
+  // ============================================================
+  //  АВТОСБРОС (06:00 МСК) — через transaction
+  // ============================================================
   function autoReset() {
-    const t = accountingDateKey();
+    const d = accountingDateKey();
     const w = accountingWeekKey();
-    let changed = false;
 
-    if (state.daily.lastReset !== t) {
+    if (state.daily.lastReset !== d) {
       state.daily.items = state.daily.items.map(i => ({ ...i, checked: false }));
-      state.daily.lastReset = t;
-      changed = true;
+      state.daily.lastReset = d;
+      renderChecklist('daily');
+      enqueueAutoReset('daily', d);
     }
     if (state.weekly.lastReset !== w) {
       state.weekly.items = state.weekly.items.map(i => ({ ...i, checked: false }));
       state.weekly.lastReset = w;
-      changed = true;
+      renderChecklist('weekly');
+      enqueueAutoReset('weekly', w);
     }
-    if (changed) save();
   }
 
-  // ---------- Рендер ----------
+  function enqueueAutoReset(kind, newKey) {
+    if (!stateRef) return;
+    enqueueWrite(async () => {
+      await stateRef.child(kind).transaction(data => {
+        // Если на сервере уже новый ключ — ничего не делаем
+        if (data && data.lastReset === newKey) return; // undefined = отмена
+        const items = (data && data.items) || {};
+        Object.keys(items).forEach(id => {
+          if (items[id] && typeof items[id] === 'object') {
+            items[id].checked = false;
+          }
+        });
+        return { items, lastReset: newKey };
+      });
+    }, 'autoReset ' + kind);
+  }
+
+  // ============================================================
+  //  РЕНДЕР
+  // ============================================================
   function renderChecklist(kind) {
     const data = state[kind];
     const listEl = document.getElementById(kind + '-list');
@@ -181,7 +226,7 @@
         cb.type = 'checkbox';
         cb.checked = !!item.checked;
         cb.id = kind + '-cb-' + item.id;
-        cb.addEventListener('change', () => { item.checked = cb.checked; save(); });
+        cb.addEventListener('change', () => toggleItem(kind, item.id, cb.checked));
 
         const label = document.createElement('label');
         label.htmlFor = cb.id;
@@ -191,10 +236,7 @@
         btn.className = 'remove-btn';
         btn.textContent = '×';
         btn.title = 'Удалить';
-        btn.addEventListener('click', () => {
-          state[kind].items = state[kind].items.filter(i => i.id !== item.id);
-          save(); renderChecklist(kind);
-        });
+        btn.addEventListener('click', () => removeItem(kind, item.id));
 
         li.appendChild(cb); li.appendChild(label); li.appendChild(btn);
         listEl.appendChild(li);
@@ -214,104 +256,174 @@
 
   function renderAll() { renderChecklist('daily'); renderChecklist('weekly'); renderTotal(); }
 
-  // ---------- Действия ----------
-  function addItem(kind, inputId) {
-    const input = document.getElementById(inputId);
-    if (!input) return;
-    const text = input.value.trim();
+  // ============================================================
+  //  ДЕЙСТВИЯ — каждая операция = только точечный путь в Firebase
+  // ============================================================
+  function addItem(kind, text) {
     if (!text) return;
-    if (!Array.isArray(state[kind].items)) state[kind].items = [];
-    state[kind].items.push({
+    const item = {
       id: Date.now() + '_' + Math.random().toString(36).slice(2, 7),
       text, checked: false
-    });
-    input.value = '';
-    save();
+    };
+    // 1) Оптимистично обновляем UI
+    if (!Array.isArray(state[kind].items)) state[kind].items = [];
+    state[kind].items.push(item);
     renderChecklist(kind);
-  }
-
-  function addExpense() {
-    const input = document.getElementById('expense-input');
-    if (!input) return;
-    const val = parseFloat(input.value);
-    if (isNaN(val) || val <= 0) { input.focus(); return; }
-    state.expenses.total = (Number(state.expenses.total) || 0) + val;
-    input.value = '';
-    save(); renderTotal();
-  }
-
-  function resetDebt() {
-    if (confirm('Обнулить долг? Это действие нельзя отменить.')) {
-      state.expenses.total = 0;
-      save(); renderTotal();
+    // 2) Ставим в очередь точечную запись (никакой перезаписи всего дерева)
+    if (stateRef) {
+      enqueueWrite(
+        () => stateRef.child(kind + '/items/' + item.id).set(item),
+        'addItem ' + kind + '/' + item.id
+      );
     }
   }
 
-  // ---------- Планировщик сброса ----------
+  function toggleItem(kind, id, checked) {
+    const item = state[kind].items.find(i => i.id === id);
+    if (item) item.checked = checked;
+    if (stateRef) {
+      enqueueWrite(
+        () => stateRef.child(kind + '/items/' + id + '/checked').set(checked),
+        'toggleItem ' + kind + '/' + id
+      );
+    }
+  }
+
+  function removeItem(kind, id) {
+    state[kind].items = state[kind].items.filter(i => i.id !== id);
+    renderChecklist(kind);
+    if (stateRef) {
+      enqueueWrite(
+        () => stateRef.child(kind + '/items/' + id).remove(),
+        'removeItem ' + kind + '/' + id
+      );
+    }
+  }
+
+  function addExpense(amount) {
+    // Оптимистично
+    state.expenses.total = (Number(state.expenses.total) || 0) + amount;
+    renderTotal();
+    // Атомарное прибавление через transaction —
+    // два одновременных addExpense от разных пользователей НЕ потеряются
+    if (stateRef) {
+      enqueueWrite(
+        () => stateRef.child('expenses/total').transaction(v => (Number(v) || 0) + amount),
+        'addExpense +' + amount
+      );
+    }
+  }
+
+  function resetDebt() {
+    if (!confirm('Обнулить долг? Это действие нельзя отменить.')) return;
+    state.expenses.total = 0;
+    renderTotal();
+    if (stateRef) {
+      enqueueWrite(
+        () => stateRef.child('expenses/total').set(0),
+        'resetDebt'
+      );
+    }
+  }
+
+  // ============================================================
+  //  ТАЙМЕР АВТОСБРОСА
+  // ============================================================
   let resetTimer = null;
   function scheduleReset() {
     if (resetTimer) clearTimeout(resetTimer);
     let delay = nextDailyResetUTC() - Date.now();
     if (delay < 0) delay = 1000;
     resetTimer = setTimeout(() => {
-      autoReset(); renderAll(); scheduleReset();
+      autoReset();
+      scheduleReset();
     }, delay + 500);
   }
 
-  // ---------- Обработчики ----------
+  // ============================================================
+  //  ОБРАБОТЧИКИ И ИНИЦИАЛИЗАЦИЯ
+  // ============================================================
   function attachListeners() {
     const bind = (id, fn) => {
       const el = document.getElementById(id);
       if (el) el.addEventListener('click', fn);
     };
-    bind('daily-add', () => addItem('daily', 'daily-input'));
-    bind('weekly-add', () => addItem('weekly', 'weekly-input'));
-    bind('expense-add', addExpense);
+    bind('daily-add', () => {
+      const inp = document.getElementById('daily-input');
+      if (!inp) return;
+      const t = inp.value.trim();
+      if (t) { addItem('daily', t); inp.value = ''; }
+    });
+    bind('weekly-add', () => {
+      const inp = document.getElementById('weekly-input');
+      if (!inp) return;
+      const t = inp.value.trim();
+      if (t) { addItem('weekly', t); inp.value = ''; }
+    });
+    bind('expense-add', () => {
+      const inp = document.getElementById('expense-input');
+      if (!inp) return;
+      const v = parseFloat(inp.value);
+      if (!isNaN(v) && v > 0) { addExpense(v); inp.value = ''; }
+      else inp.focus();
+    });
     bind('reset-debt', resetDebt);
 
     const d = document.getElementById('daily-input');
-    if (d) d.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('daily', 'daily-input'); });
+    if (d) d.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const t = d.value.trim();
+        if (t) { addItem('daily', t); d.value = ''; }
+      }
+    });
     const w = document.getElementById('weekly-input');
-    if (w) w.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('weekly', 'weekly-input'); });
+    if (w) w.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const t = w.value.trim();
+        if (t) { addItem('weekly', t); w.value = ''; }
+      }
+    });
     const ex = document.getElementById('expense-input');
-    if (ex) ex.addEventListener('keydown', e => { if (e.key === 'Enter') addExpense(); });
+    if (ex) ex.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const v = parseFloat(ex.value);
+        if (!isNaN(v) && v > 0) { addExpense(v); ex.value = ''; }
+      }
+    });
   }
 
-  // ---------- Инициализация ----------
-  function init() {
+  async function init() {
+    // 1) локальный кеш — мгновенный отклик
     try {
       const raw = localStorage.getItem('accounting_app_v1');
       if (raw) state = normalizeState(JSON.parse(raw));
     } catch (e) {}
-    autoReset();
     renderAll();
 
+    // 2) сразу привязываем кнопки
     attachListeners();
 
+    // 3) синхронизация с сервером
     if (stateRef) {
-      loadFromServer().then(() => { autoReset(); renderAll(); });
-
-      stateRef.on('value', snap => {
-        const data = snap.val();
-        if (!data) return;
-        const serverJson = JSON.stringify(data);
-        if (serverJson !== lastServerJson) {
-          state = normalizeState(data);
-          lastServerJson = serverJson;
-          autoReset();
-          renderAll();
-        }
-      });
+      await loadFromServer();
+      attachServerListener();
     }
 
+    // 4) проверка автосброса — ПОСЛЕ получения актуального lastReset
+    autoReset();
+
+    // 5) периодические проверки
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) {
-        if (stateRef) loadFromServer().then(() => { autoReset(); renderAll(); });
-        else { autoReset(); renderAll(); }
+      if (!document.hidden && stateRef) {
+        loadFromServer().then(autoReset);
       }
     });
+    setInterval(() => {
+      renderChecklist('daily');
+      renderChecklist('weekly');
+    }, 60 * 1000);
+    setInterval(autoReset, 60 * 1000);
 
-    setInterval(() => { renderChecklist('daily'); renderChecklist('weekly'); }, 60 * 1000);
     scheduleReset();
   }
 
