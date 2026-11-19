@@ -21,8 +21,6 @@
     if (typeof firebase !== 'undefined') {
       firebase.initializeApp(firebaseConfig);
       stateRef = firebase.database().ref('accounting_state');
-    } else {
-      console.warn('[app] Firebase SDK не загружен');
     }
   } catch (e) { console.warn('[app] Firebase:', e); }
 
@@ -54,15 +52,11 @@
     for (const [key, val] of entries) {
       if (!val || typeof val !== 'object') continue;
       let id = val.id;
-      if (!id) {
-        if (!/^\d+$/.test(key)) id = key;
-      }
+      if (!id) { if (!/^\d+$/.test(key)) id = key; }
       if (!id) continue;
       if (!val.text || typeof val.text !== 'string') continue;
       out[id] = {
-        id: id,
-        text: val.text,
-        checked: !!val.checked,
+        id: id, text: val.text, checked: !!val.checked,
         ...(typeof val.createdAt === 'number' ? { createdAt: val.createdAt } : {})
       };
     }
@@ -71,12 +65,12 @@
 
   function itemOrder(item) {
     if (typeof item.createdAt === 'number') return item.createdAt;
-    const fromId = parseInt(String(item.id).split('_')[0], 10);
-    return isNaN(fromId) ? Infinity : fromId;
+    const n = parseInt(String(item.id).split('_')[0], 10);
+    return isNaN(n) ? Infinity : n;
   }
 
-  function itemsToSortedArray(itemsObj) {
-    const arr = Object.values(itemsObj);
+  function itemsToSortedArray(obj) {
+    const arr = Object.values(obj);
     arr.sort((a, b) => {
       if (a.checked !== b.checked) return a.checked ? 1 : -1;
       return itemOrder(a) - itemOrder(b);
@@ -94,15 +88,11 @@
       if (src.lastReset) out[kind].lastReset = src.lastReset;
     });
     if (raw.expenses && typeof raw.expenses === 'object') {
-      if (typeof raw.expenses.total === 'number') {
-        out.expenses.total = raw.expenses.total;
-      }
+      if (typeof raw.expenses.total === 'number') out.expenses.total = raw.expenses.total;
       if (raw.expenses.contributions && typeof raw.expenses.contributions === 'object') {
         for (const p of PARTICIPANTS) {
           const v = raw.expenses.contributions[p];
-          if (typeof v === 'number' && isFinite(v)) {
-            out.expenses.contributions[p] = v;
-          }
+          if (typeof v === 'number' && isFinite(v)) out.expenses.contributions[p] = v;
         }
       }
     }
@@ -143,7 +133,6 @@
            p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ' МСК';
   }
 
-  // ---------- Форматирование чисел ----------
   function fmtMoney(n) {
     const v = Number(n) || 0;
     if (Number.isInteger(v)) return v.toLocaleString('ru-RU');
@@ -151,7 +140,7 @@
   }
 
   // ============================================================
-  //  WRITE QUEUE (с таймаутом на операцию)
+  //  WRITE QUEUE
   // ============================================================
   const writeQueue = [];
   let isProcessingQueue = false;
@@ -164,9 +153,8 @@
 
   function withTimeout(promise, ms) {
     return Promise.race([
-      promise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('timeout ' + ms + 'ms')), ms))
+      Promise.resolve(promise),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout ' + ms + 'ms')), ms))
     ]);
   }
 
@@ -179,7 +167,7 @@
         let ok = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
-            await withTimeout(Promise.resolve(item.fn()), OP_TIMEOUT_MS);
+            await withTimeout(item.fn(), OP_TIMEOUT_MS);
             ok = true;
             console.log('[app] OK:', item.description);
             break;
@@ -231,6 +219,62 @@
   }
 
   // ============================================================
+  //  ГАРАНТИРОВАННАЯ МИГРАЦИЯ expenses
+  //  Создаёт contributions на сервере, если их нет
+  // ============================================================
+  async function ensureExpensesStructure() {
+    if (!stateRef) return;
+    try {
+      const snap = await stateRef.child('expenses').once('value');
+      const curr = snap.val();
+
+      if (curr === null) {
+        await stateRef.child('expenses').set({
+          total: 0,
+          contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
+        });
+        console.log('[app] ensureExpenses: created fresh structure');
+        return;
+      }
+
+      // Скаляр (число/строка) — старая структура
+      if (typeof curr !== 'object') {
+        await stateRef.child('expenses').set({
+          total: Number(curr) || 0,
+          contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
+        });
+        console.log('[app] ensureExpenses: fixed scalar total');
+        return;
+      }
+
+      // Есть total, но нет contributions
+      if (!curr.contributions) {
+        await stateRef.child('expenses/contributions').set({
+          ArhonDD: 0, eMachines: 0, Asta: 0
+        });
+        console.log('[app] ensureExpenses: created contributions');
+        return;
+      }
+
+      // contributions есть, но не у всех участников — дополняем
+      const updates = {};
+      let needs = false;
+      for (const p of PARTICIPANTS) {
+        if (typeof curr.contributions[p] !== 'number') {
+          updates['expenses/contributions/' + p] = 0;
+          needs = true;
+        }
+      }
+      if (needs) {
+        await stateRef.update(updates);
+        console.log('[app] ensureExpenses: filled missing participants');
+      }
+    } catch (e) {
+      console.warn('[app] ensureExpenses:', e);
+    }
+  }
+
+  // ============================================================
   //  ТРАНЗАКЦИИ на узел daily / weekly
   // ============================================================
   function txKind(kind, mutator) {
@@ -266,7 +310,6 @@
       enqueueAutoReset('weekly', w);
     }
   }
-
   function enqueueAutoReset(kind, newKey) {
     if (!stateRef) return;
     enqueueWrite(() => txKind(kind, (base, items) => {
@@ -344,21 +387,28 @@
 
   function renderDebts() {
     const grid = document.getElementById('debts-grid');
-    if (!grid) return;
+    if (!grid) {
+      console.warn('[app] #debts-grid не найден — обновите index.html');
+      return;
+    }
     grid.innerHTML = '';
     const debts = computeDebts();
     debts.forEach(d => {
       const block = document.createElement('div');
       block.className = 'debt-block' + (d.owes === 0 ? ' zero' : '');
-      const amountEl = document.createElement('div');
-      amountEl.className = 'debt-amount';
-      amountEl.textContent = d.owes === 0 ? '0 ₽' : fmtMoney(d.owes) + ' ₽';
+
       const nameEl = document.createElement('div');
       nameEl.className = 'debt-name';
       nameEl.textContent = d.name;
+
+      const amountEl = document.createElement('div');
+      amountEl.className = 'debt-amount';
+      amountEl.textContent = d.owes === 0 ? '0 ₽' : fmtMoney(d.owes) + ' ₽';
+
       const hintEl = document.createElement('div');
       hintEl.className = 'debt-hint';
       hintEl.innerHTML = 'вложил <b>' + fmtMoney(d.contributed) + ' ₽</b><br>доля <b>' + fmtMoney(d.fair) + ' ₽</b>';
+
       block.appendChild(nameEl);
       block.appendChild(amountEl);
       block.appendChild(hintEl);
@@ -420,7 +470,10 @@
   }
 
   // ============================================================
-  //  ДЕЙСТВИЯ: расходы (единая транзакция на узел expenses)
+  //  ДЕЙСТВИЯ: расходы
+  //  Сначала пробуем атомарную транзакцию на expenses.
+  //  Если правило Firebase не разрешает запись в узел-родитель —
+  //  падаем в fallback: две отдельные транзакции по листьям.
   // ============================================================
   function addExpense(person, amount) {
     if (!PARTICIPANTS.includes(person)) return;
@@ -433,18 +486,29 @@
     renderTotal();
     renderDebts();
 
-    if (stateRef) {
-      enqueueWrite(() => stateRef.child('expenses').transaction(curr => {
-        const base = (curr && typeof curr === 'object') ? curr : {};
-        const total = (Number(base.total) || 0) + amount;
-        const contribs = Object.assign(
-          { ArhonDD: 0, eMachines: 0, Asta: 0 },
-          base.contributions || {}
-        );
-        contribs[person] = (Number(contribs[person]) || 0) + amount;
-        return { total, contributions: contribs };
-      }), 'addExpense ' + person + ' +' + amount);
-    }
+    if (!stateRef) return;
+
+    enqueueWrite(async () => {
+      try {
+        await stateRef.child('expenses').transaction(curr => {
+          const base = (curr && typeof curr === 'object') ? curr : {};
+          const total = (Number(base.total) || 0) + amount;
+          const contribs = Object.assign(
+            { ArhonDD: 0, eMachines: 0, Asta: 0 },
+            base.contributions || {}
+          );
+          contribs[person] = (Number(contribs[person]) || 0) + amount;
+          return { total, contributions: contribs };
+        });
+        console.log('[app] addExpense OK (parent tx):', person, '+', amount);
+      } catch (e) {
+        console.warn('[app] addExpense parent tx failed, FALLBACK:', e && e.message);
+        await stateRef.child('expenses/total').transaction(v => (Number(v) || 0) + amount);
+        await stateRef.child('expenses/contributions/' + person)
+          .transaction(v => (Number(v) || 0) + amount);
+        console.log('[app] addExpense OK (fallback):', person, '+', amount);
+      }
+    }, 'addExpense ' + person + ' +' + amount);
   }
 
   function resetDebt() {
@@ -453,16 +517,29 @@
     state.expenses.contributions = { ArhonDD: 0, eMachines: 0, Asta: 0 };
     renderTotal();
     renderDebts();
+
     if (stateRef) {
-      enqueueWrite(() => stateRef.child('expenses').set({
-        total: 0,
-        contributions: { ArhonDD: 0, eMachines: 0, Asta: 0 }
-      }), 'resetDebt');
+      enqueueWrite(async () => {
+        try {
+          // Атомарный update по конкретным путям —
+          // работает даже при жёстких per-leaf правилах
+          await stateRef.update({
+            'expenses/total': 0,
+            'expenses/contributions/ArhonDD': 0,
+            'expenses/contributions/eMachines': 0,
+            'expenses/contributions/Asta': 0
+          });
+          console.log('[app] resetDebt OK');
+        } catch (e) {
+          console.error('[app] resetDebt FAILED:', e && e.message);
+          throw e;
+        }
+      }, 'resetDebt');
     }
   }
 
   // ============================================================
-  //  ЧИСТКА фантомов (не блокирует пользовательские действия)
+  //  ЧИСТКА фантомов
   // ============================================================
   async function cleanupPhantoms() {
     if (!stateRef) return;
@@ -482,9 +559,9 @@
         let needs = false;
         for (const [key, val] of entries) {
           if (!val || typeof val !== 'object') { needs = true; break; }
-          if (/^\d+$/.test(key)) { needs = true; break; }     // numeric key = legacy
-          if (!val.id || !val.text) { needs = true; break; }   // phantom
-          if (val.id !== key) { needs = true; break; }         // key mismatch
+          if (/^\d+$/.test(key)) { needs = true; break; }
+          if (!val.id || !val.text) { needs = true; break; }
+          if (val.id !== key) { needs = true; break; }
         }
         if (!needs) continue;
 
@@ -514,11 +591,6 @@
     const sel = document.getElementById('expense-person');
     return sel ? sel.value : 'ArhonDD';
   }
-  function setPerson(p) {
-    const sel = document.getElementById('expense-person');
-    if (!sel) return;
-    if (PARTICIPANTS.includes(p)) sel.value = p;
-  }
 
   function attachListeners() {
     const bind = (id, fn) => {
@@ -542,12 +614,8 @@
       const inp = document.getElementById('expense-input');
       if (!inp) return;
       const v = parseFloat(inp.value);
-      if (!isNaN(v) && v > 0) {
-        addExpense(getPerson(), v);
-        inp.value = '';
-      } else {
-        inp.focus();
-      }
+      if (!isNaN(v) && v > 0) { addExpense(getPerson(), v); inp.value = ''; }
+      else inp.focus();
     });
     bind('reset-debt', resetDebt);
 
@@ -567,7 +635,6 @@
       }
     });
 
-    // Запоминаем выбранного участника
     const sel = document.getElementById('expense-person');
     if (sel) {
       try {
@@ -589,10 +656,9 @@
     attachListeners();
 
     if (stateRef) {
+      await ensureExpensesStructure();
       await loadFromServer();
       attachServerListener();
-      // Очистка идёт в фоне; пользователь может работать параллельно,
-      // потому что очередь операций последовательна, а таймаут не даёт «залипнуть».
       cleanupPhantoms();
     }
 

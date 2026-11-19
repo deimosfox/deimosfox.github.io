@@ -37,11 +37,13 @@
   <div class="card">
     <h2>Учет трат</h2>
     <div class="expense-row">
-      <select id="expense-person" class="expense-select" title="Кто потратил">
-        <option value="ArhonDD">ArhonDD</option>
-        <option value="eMachines">eMachines</option>
-        <option value="Asta">Asta</option>
-      </select>
+      <div class="field-wrap field-wrap-select">
+        <select id="expense-person" class="expense-select" title="Кто потратил">
+          <option value="ArhonDD">ArhonDD</option>
+          <option value="eMachines">eMachines</option>
+          <option value="Asta">Asta</option>
+        </select>
+      </div>
       <input type="number" id="expense-input" placeholder="Сумма, ₽" min="0" step="0.01">
       <button class="btn btn-primary" id="expense-add">Добавить</button>
     </div>
